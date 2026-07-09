@@ -1,5 +1,6 @@
-import { Controller, Get, Patch, Body, Param, Query, UseGuards, Req, ForbiddenException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Body, Param, Query, UseGuards, Req, HttpCode, HttpStatus } from '@nestjs/common';
 import { VendorsService } from './vendors.service';
+import { CarsService } from '../cars/cars.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -8,12 +9,17 @@ import { VendorsQueryDto } from './dto/vendors-query.dto';
 import { UpdateVendorDto } from './dto/update-vendor.dto';
 import { UpdateVendorStatusDto } from './dto/update-vendor-status.dto';
 import { PaginationDto } from '../common/pagination.dto';
+import { CreateCarDto } from '../cars/dto/create-car.dto';
+import { UpdateCarDto } from '../cars/dto/update-car.dto';
+import { UpdateAvailabilityDto } from '../cars/dto/update-availability.dto';
+import { UpdateBlockedDatesDto } from '../cars/dto/update-blocked-dates.dto';
 import { JwtService } from '@nestjs/jwt';
 
 @Controller('vendors')
 export class VendorsController {
   constructor(
     private readonly vendorsService: VendorsService,
+    private readonly carsService: CarsService,
     private readonly jwtService: JwtService,
   ) {}
 
@@ -38,6 +44,58 @@ export class VendorsController {
   async updateMe(@Req() req: any, @Body() dto: UpdateVendorDto) {
     return this.vendorsService.updateMe(req.user.userId, dto);
   }
+
+  // --- Vendor own fleet operations (Must be defined before wildcard GET :id routes) ---
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.VENDOR)
+  @Get('me/cars')
+  async findVendorCars(@Req() req: any) {
+    return this.carsService.findVendorCars(req.user.userId);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.VENDOR)
+  @Post('me/cars')
+  @HttpCode(HttpStatus.CREATED)
+  async createCar(@Req() req: any, @Body() dto: CreateCarDto) {
+    return this.carsService.createCar(req.user.userId, dto);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.VENDOR)
+  @Patch('me/cars/:id')
+  async updateCar(
+    @Param('id') id: string,
+    @Req() req: any,
+    @Body() dto: UpdateCarDto,
+  ) {
+    return this.carsService.updateCar(id, req.user.userId, dto);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.VENDOR)
+  @Patch('me/cars/:id/availability')
+  async updateAvailability(
+    @Param('id') id: string,
+    @Req() req: any,
+    @Body() dto: UpdateAvailabilityDto,
+  ) {
+    return this.carsService.updateAvailability(id, req.user.userId, dto.isAvailable);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.VENDOR)
+  @Patch('me/cars/:id/blocked-dates')
+  async updateBlockedDates(
+    @Param('id') id: string,
+    @Req() req: any,
+    @Body() dto: UpdateBlockedDatesDto,
+  ) {
+    return this.carsService.updateBlockedDates(id, req.user.userId, dto.blockedDates);
+  }
+
+  // --- Wildcard & Param based routes ---
 
   @Get(':id')
   async findOne(@Req() req: any, @Param('id') id: string) {

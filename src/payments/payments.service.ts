@@ -29,6 +29,10 @@ export class PaymentsService {
     this.webhookSecret = this.configService.get<string>('RAZORPAY_WEBHOOK_SECRET') || 'placeholderWebhookSecret';
     this.useMock = this.configService.get<string>('RAZORPAY_USE_MOCK') === 'true';
 
+    if (this.useMock && this.configService.get<string>('NODE_ENV') === 'production') {
+      throw new Error('CRITICAL SECURITY CONFIGURATION ERROR: RAZORPAY_USE_MOCK is set to true, but NODE_ENV is production! Bypassing payment verification in production is forbidden.');
+    }
+
     if (!this.useMock) {
       try {
         this.razorpay = new Razorpay({

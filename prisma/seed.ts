@@ -365,6 +365,40 @@ async function main() {
     ],
   });
 
+  // 8. Create Banners
+  await prisma.banner.createMany({
+    data: [
+      {
+        title: 'Super Summer Sale',
+        imageUrl: 'https://images.unsplash.com/photo-1549399542-7e3f8b79c341',
+        ctaLink: 'https://drivego.in/offers/summer',
+        displayOrder: 2,
+        isActive: true,
+      },
+      {
+        title: 'Explore Luxury Drives',
+        imageUrl: 'https://images.unsplash.com/photo-1555215695-3004980ad54e',
+        ctaLink: 'https://drivego.in/offers/luxury',
+        displayOrder: 1,
+        isActive: true,
+      },
+      {
+        title: 'Expired Offer',
+        imageUrl: 'https://images.unsplash.com/photo-1503376780353-7e6692767b70',
+        ctaLink: 'https://drivego.in/offers/expired',
+        displayOrder: 0,
+        isActive: false,
+      },
+      {
+        title: 'Outstation Getaways',
+        imageUrl: 'https://images.unsplash.com/photo-1502877338535-766e1452684a',
+        ctaLink: 'https://drivego.in/offers/outstation',
+        displayOrder: 3,
+        isActive: true,
+      },
+    ],
+  });
+
   console.log('Seeding completed successfully!');
 }
 

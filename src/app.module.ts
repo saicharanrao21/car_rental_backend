@@ -14,6 +14,9 @@ import { ReviewsModule } from './reviews/reviews.module';
 import { PaymentsModule } from './payments/payments.module';
 import { UploadsModule } from './uploads/uploads.module';
 import { PayoutsModule } from './payouts/payouts.module';
+import { AdminModule } from './admin/admin.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { BannersModule } from './banners/banners.module';
 
 @Module({
   imports: [
@@ -30,6 +33,9 @@ import { PayoutsModule } from './payouts/payouts.module';
     PaymentsModule,
     UploadsModule,
     PayoutsModule,
+    AdminModule,
+    NotificationsModule,
+    BannersModule,
   ],
   controllers: [AppController],
   providers: [AppService],

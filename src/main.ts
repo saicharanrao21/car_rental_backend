@@ -23,6 +23,7 @@ async function bootstrap() {
     }),
   );
   app.use(urlencoded({ extended: true }));
+  app.enableCors();
 
   app.useGlobalPipes(
     new ValidationPipe({

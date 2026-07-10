@@ -8,6 +8,9 @@ import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { VendorsModule } from './vendors/vendors.module';
 import { CarsModule } from './cars/cars.module';
+import { CommonModule } from './common/common.module';
+import { BookingsModule } from './bookings/bookings.module';
+import { ReviewsModule } from './reviews/reviews.module';
 
 @Module({
   imports: [
@@ -18,6 +21,9 @@ import { CarsModule } from './cars/cars.module';
     UsersModule,
     VendorsModule,
     CarsModule,
+    CommonModule,
+    BookingsModule,
+    ReviewsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

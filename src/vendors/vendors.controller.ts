@@ -14,6 +14,9 @@ import { UpdateCarDto } from '../cars/dto/update-car.dto';
 import { UpdateAvailabilityDto } from '../cars/dto/update-availability.dto';
 import { UpdateBlockedDatesDto } from '../cars/dto/update-blocked-dates.dto';
 import { JwtService } from '@nestjs/jwt';
+import { CreateDocumentDto } from './dto/create-document.dto';
+import { UpdateDocumentStatusDto } from './dto/update-document-status.dto';
+
 
 @Controller('vendors')
 export class VendorsController {
@@ -120,6 +123,25 @@ export class VendorsController {
   async updateStatus(@Param('id') id: string, @Body() dto: UpdateVendorStatusDto) {
     return this.vendorsService.updateStatus(id, dto);
   }
+
+  // --- Vendor document operations ---
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.VENDOR)
+  @Post('me/documents')
+  @HttpCode(HttpStatus.CREATED)
+  async addDocument(@Req() req: any, @Body() dto: CreateDocumentDto) {
+    return this.vendorsService.addDocument(req.user.userId, dto.type, dto.fileUrl);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.VENDOR)
+  @Get('me/documents')
+  async getDocuments(@Req() req: any) {
+    return this.vendorsService.getDocuments(req.user.userId);
+  }
+
+
 
   // --- Helper Methods ---
 

@@ -12,6 +12,8 @@ import { CommonModule } from './common/common.module';
 import { BookingsModule } from './bookings/bookings.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { PaymentsModule } from './payments/payments.module';
+import { UploadsModule } from './uploads/uploads.module';
+import { PayoutsModule } from './payouts/payouts.module';
 
 @Module({
   imports: [
@@ -26,6 +28,8 @@ import { PaymentsModule } from './payments/payments.module';
     BookingsModule,
     ReviewsModule,
     PaymentsModule,
+    UploadsModule,
+    PayoutsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

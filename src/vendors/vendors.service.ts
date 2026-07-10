@@ -184,4 +184,58 @@ export class VendorsService {
       data: { verificationStatus: dto.status },
     });
   }
+
+  async addDocument(userId: string, type: any, fileUrl: string) {
+    const vendor = await this.prisma.vendor.findUnique({
+      where: { userId },
+    });
+
+    if (!vendor) {
+      throw new NotFoundException('Vendor profile not found');
+    }
+
+    return this.prisma.document.create({
+      data: {
+        vendorId: vendor.id,
+        type,
+        fileUrl,
+        status: 'PENDING',
+      },
+    });
+  }
+
+  async getDocuments(userId: string) {
+    const vendor = await this.prisma.vendor.findUnique({
+      where: { userId },
+    });
+
+    if (!vendor) {
+      throw new NotFoundException('Vendor profile not found');
+    }
+
+    return this.prisma.document.findMany({
+      where: { vendorId: vendor.id },
+      orderBy: { uploadedAt: 'desc' },
+    });
+  }
+
+  async updateDocumentStatus(vendorId: string, documentId: string, status: any) {
+    const document = await this.prisma.document.findUnique({
+      where: { id: documentId },
+    });
+
+    if (!document) {
+      throw new NotFoundException('Document not found');
+    }
+
+    if (document.vendorId !== vendorId) {
+      throw new NotFoundException('Document does not belong to the specified vendor');
+    }
+
+    return this.prisma.document.update({
+      where: { id: documentId },
+      data: { status },
+    });
+  }
 }
+

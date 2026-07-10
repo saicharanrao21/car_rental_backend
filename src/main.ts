@@ -3,6 +3,11 @@ import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
 import { ExcludePasswordHashInterceptor } from './common/exclude-password-hash.interceptor';
 import { json, urlencoded } from 'express';
+import { Prisma } from '@prisma/client';
+
+Prisma.Decimal.prototype.toJSON = function () {
+  return this.toNumber();
+};
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });

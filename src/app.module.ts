@@ -11,6 +11,7 @@ import { CarsModule } from './cars/cars.module';
 import { CommonModule } from './common/common.module';
 import { BookingsModule } from './bookings/bookings.module';
 import { ReviewsModule } from './reviews/reviews.module';
+import { PaymentsModule } from './payments/payments.module';
 
 @Module({
   imports: [
@@ -24,8 +25,10 @@ import { ReviewsModule } from './reviews/reviews.module';
     CommonModule,
     BookingsModule,
     ReviewsModule,
+    PaymentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
 })
 export class AppModule {}
+

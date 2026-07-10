@@ -12,6 +12,8 @@ import { FareCalculatorService } from '../common/fare-calculator.service';
 import { CreateBookingDto } from './dto/create-booking.dto';
 import { BookingStatus, Role, TripType, Prisma } from '@prisma/client';
 import { PaginationDto } from '../common/pagination.dto';
+import { PaymentsService } from '../payments/payments.service';
+
 
 @Injectable()
 export class BookingsService {
@@ -20,7 +22,9 @@ export class BookingsService {
     private readonly bookingLockService: BookingLockService,
     private readonly commissionResolver: CommissionResolverService,
     private readonly fareCalculator: FareCalculatorService,
+    private readonly paymentsService: PaymentsService,
   ) {}
+
 
   async createBooking(customerId: string, dto: CreateBookingDto) {
     const start = new Date(dto.startDate);
@@ -355,6 +359,10 @@ export class BookingsService {
       throw new BadRequestException('Vendors must specify a reason when rejecting/cancelling a booking.');
     }
 
+    if (newStatus === BookingStatus.CANCELLED) {
+      await this.paymentsService.refund(bookingId, reason);
+    }
+
     return this.prisma.booking.update({
       where: { id: bookingId },
       data: {
@@ -382,6 +390,8 @@ export class BookingsService {
     if (!allowed.includes(BookingStatus.CANCELLED)) {
       throw new BadRequestException(`Cannot cancel booking in ${booking.status} status.`);
     }
+
+    await this.paymentsService.refund(bookingId, reason);
 
     return this.prisma.booking.update({
       where: { id: bookingId },

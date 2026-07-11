@@ -3,7 +3,8 @@ import {
   NotFoundException, 
   ConflictException, 
   ForbiddenException, 
-  BadRequestException 
+  BadRequestException,
+  Logger
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { BookingLockService } from '../redis/booking-lock.service';
@@ -13,16 +14,19 @@ import { CreateBookingDto } from './dto/create-booking.dto';
 import { BookingStatus, Role, TripType, Prisma } from '@prisma/client';
 import { PaginationDto } from '../common/pagination.dto';
 import { PaymentsService } from '../payments/payments.service';
-
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class BookingsService {
+  private readonly logger = new Logger(BookingsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly bookingLockService: BookingLockService,
     private readonly commissionResolver: CommissionResolverService,
     private readonly fareCalculator: FareCalculatorService,
     private readonly paymentsService: PaymentsService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
 
@@ -39,7 +43,7 @@ export class BookingsService {
 
     try {
       // 2. Perform transactional double-booking check and creation
-      return await this.prisma.$transaction(async (tx) => {
+      const booking = await this.prisma.$transaction(async (tx) => {
         // Fetch car fresh to get latest blockages/availability
         const car = await tx.car.findUnique({
           where: { id: dto.carId },
@@ -95,10 +99,6 @@ export class BookingsService {
         );
 
         // 4. Calculate fare
-        // BUSINESS RULE:
-        // - LOCAL and AIRPORT_TRANSFER use hourly rates (pricePerHour * duration in hours).
-        // - SELF_DRIVE and OUTSTATION use daily rates (pricePerDay * duration in days).
-        // - Distance charges (distanceKm * pricePerKm) are added if distanceKm is provided.
         const durationMs = end.getTime() - start.getTime();
         let basePackagePrice = new Prisma.Decimal(0);
 
@@ -120,7 +120,7 @@ export class BookingsService {
         );
 
         // 5. Create booking row
-        const booking = await tx.booking.create({
+        const newBooking = await tx.booking.create({
           data: {
             customerId,
             vendorId: car.vendorId,
@@ -151,8 +151,25 @@ export class BookingsService {
           },
         });
 
-        return booking;
+        return newBooking;
       });
+
+      // After transaction completes, notify vendor
+      const vendorUser = await this.prisma.vendor.findUnique({
+        where: { id: booking.vendorId },
+        select: { userId: true },
+      });
+      if (vendorUser) {
+        this.notificationsService
+          .notifyUser(
+            vendorUser.userId,
+            'New Booking Request',
+            `You have received a new booking request for ${booking.car.make} ${booking.car.model} (${booking.car.registrationNumber}).`,
+          )
+          .catch((err) => this.logger.error('Failed to notify vendor of new booking', err));
+      }
+
+      return booking;
     } finally {
       // 6. Release lock
       await this.bookingLockService.releaseLock(dto.carId, start, end, lockToken);
@@ -363,7 +380,7 @@ export class BookingsService {
       await this.paymentsService.refund(bookingId, reason);
     }
 
-    return this.prisma.booking.update({
+    const updatedBooking = await this.prisma.booking.update({
       where: { id: bookingId },
       data: {
         status: newStatus,
@@ -371,11 +388,31 @@ export class BookingsService {
       },
       include: { car: true, customer: true },
     });
+
+    let title = '';
+    let body = '';
+    if (newStatus === BookingStatus.CONFIRMED) {
+      title = 'Booking Confirmed';
+      body = `Your booking for ${updatedBooking.car.make} ${updatedBooking.car.model} (${updatedBooking.car.registrationNumber}) has been accepted.`;
+    } else if (newStatus === BookingStatus.CANCELLED) {
+      title = 'Booking Cancelled';
+      body = `Your booking for ${updatedBooking.car.make} ${updatedBooking.car.model} (${updatedBooking.car.registrationNumber}) was rejected/cancelled.`;
+    } else {
+      title = 'Booking Update';
+      body = `Your booking status has been updated to ${newStatus}.`;
+    }
+
+    this.notificationsService
+      .notifyUser(updatedBooking.customerId, title, body)
+      .catch((err) => this.logger.error('Failed to notify customer of status update', err));
+
+    return updatedBooking;
   }
 
   async cancelBooking(bookingId: string, customerId: string, reason: string) {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
+      include: { vendor: true },
     });
 
     if (!booking) {
@@ -393,14 +430,26 @@ export class BookingsService {
 
     await this.paymentsService.refund(bookingId, reason);
 
-    return this.prisma.booking.update({
+    const updatedBooking = await this.prisma.booking.update({
       where: { id: bookingId },
       data: {
         status: BookingStatus.CANCELLED,
         cancellationReason: reason,
       },
-      include: { car: true },
+      include: { car: true, vendor: true },
     });
+
+    if (updatedBooking.vendor?.userId) {
+      this.notificationsService
+        .notifyUser(
+          updatedBooking.vendor.userId,
+          'Booking Cancelled',
+          `Booking for ${updatedBooking.car.make} ${updatedBooking.car.model} (${updatedBooking.car.registrationNumber}) has been cancelled by the customer.`,
+        )
+        .catch((err) => this.logger.error('Failed to notify vendor of cancellation', err));
+    }
+
+    return updatedBooking;
   }
 
   async flagDispute(bookingId: string, note: string) {

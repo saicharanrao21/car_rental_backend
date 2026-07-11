@@ -10,6 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import Razorpay from 'razorpay';
 import { Role, PaymentStatus, BookingStatus } from '@prisma/client';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class PaymentsService {
@@ -23,6 +24,7 @@ export class PaymentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly notificationsService: NotificationsService,
   ) {
     this.keyId = this.configService.get<string>('RAZORPAY_KEY_ID') || 'rzp_test_placeholderKeyId';
     this.keySecret = this.configService.get<string>('RAZORPAY_KEY_SECRET') || 'placeholderKeySecret';
@@ -158,7 +160,7 @@ export class PaymentsService {
         return { received: true };
       }
 
-      await this.prisma.$transaction(async (tx) => {
+      const booking = await this.prisma.$transaction(async (tx) => {
         await tx.payment.update({
           where: { id: payment.id },
           data: {
@@ -167,18 +169,30 @@ export class PaymentsService {
           },
         });
 
-        const booking = await tx.booking.findUnique({
+        const b = await tx.booking.findUnique({
           where: { id: payment.bookingId },
         });
 
-        if (booking && booking.status === BookingStatus.PENDING) {
-          await tx.booking.update({
-            where: { id: booking.id },
+        if (b && b.status === BookingStatus.PENDING) {
+          const updated = await tx.booking.update({
+            where: { id: b.id },
             data: { status: BookingStatus.CONFIRMED },
           });
-          this.logger.log(`Booking ${booking.id} status updated to CONFIRMED due to payment capture`);
+          this.logger.log(`Booking ${b.id} status updated to CONFIRMED due to payment capture`);
+          return updated;
         }
+        return b;
       });
+
+      if (booking) {
+        this.notificationsService
+          .notifyUser(
+            booking.customerId,
+            'Payment Confirmed',
+            `Your payment of INR ${payment.amount} for booking ${booking.id} was confirmed.`,
+          )
+          .catch((err) => this.logger.error('Failed to notify customer of payment capture', err));
+      }
     } else if (event === 'payment.failed') {
       const paymentEntity = payload.payload.payment.entity;
       const orderId = paymentEntity.order_id;

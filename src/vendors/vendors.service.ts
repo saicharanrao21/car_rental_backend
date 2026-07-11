@@ -1,13 +1,19 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { VendorsQueryDto } from './dto/vendors-query.dto';
 import { UpdateVendorDto } from './dto/update-vendor.dto';
 import { UpdateVendorStatusDto } from './dto/update-vendor-status.dto';
 import { PaginatedResult } from '../common/pagination.dto';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class VendorsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(VendorsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notificationsService: NotificationsService,
+  ) {}
 
   async findAll(query: VendorsQueryDto): Promise<PaginatedResult<any>> {
     const page = query.page || 1;
@@ -179,10 +185,20 @@ export class VendorsService {
       throw new NotFoundException('Vendor not found');
     }
 
-    return this.prisma.vendor.update({
+    const updated = await this.prisma.vendor.update({
       where: { id },
       data: { verificationStatus: dto.status },
     });
+
+    this.notificationsService
+      .notifyUser(
+        vendor.userId,
+        `Account Status Update`,
+        `Your vendor account status has been updated to ${dto.status}.`,
+      )
+      .catch((err) => this.logger.error('Failed to notify vendor of status update', err));
+
+    return updated;
   }
 
   async addDocument(userId: string, type: any, fileUrl: string) {

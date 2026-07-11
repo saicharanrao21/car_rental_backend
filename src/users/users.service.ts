@@ -28,6 +28,23 @@ export class UsersService {
     });
   }
 
+  async updateFcmToken(userId: string, token: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        fcmToken: token,
+      },
+    });
+  }
+
   async findAll(query: UsersQueryDto): Promise<PaginatedResult<any>> {
     const page = query.page || 1;
     const limit = query.limit || 20;

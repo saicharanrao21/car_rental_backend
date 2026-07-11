@@ -1,12 +1,16 @@
 import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { PayoutStatus, Prisma } from '@prisma/client';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class PayoutsService {
   private readonly logger = new Logger(PayoutsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notificationsService: NotificationsService,
+  ) {}
 
   async getVendorEarningsSummary(vendorId: string) {
     const vendorExists = await this.prisma.vendor.findUnique({
@@ -157,13 +161,26 @@ export class PayoutsService {
       this.logger.log(`Marking payout ${payoutId} as PAID. Admin Note: ${adminNote}`);
     }
 
-    return this.prisma.payout.update({
+    const updated = await this.prisma.payout.update({
       where: { id: payoutId },
       data: {
         status: PayoutStatus.PAID,
         paidAt: new Date(),
       },
+      include: {
+        vendor: true,
+      },
     });
+
+    this.notificationsService
+      .notifyUser(
+        updated.vendor.userId,
+        'Payout Marked Paid',
+        `Your payout of INR ${updated.amount} has been processed and marked as paid.`,
+      )
+      .catch((err) => this.logger.error('Failed to notify vendor of payout status change', err));
+
+    return updated;
   }
 
   async getPayoutHistory(vendorId: string) {

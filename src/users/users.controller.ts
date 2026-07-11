@@ -8,6 +8,7 @@ import { UpdateMeDto } from './dto/update-me.dto';
 import { UsersQueryDto } from './dto/users-query.dto';
 import { BanUserDto } from './dto/ban-user.dto';
 import { PaginationDto } from '../common/pagination.dto';
+import { FcmTokenDto } from '../notifications/dto/fcm-token.dto';
 
 @Controller('users')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -17,6 +18,11 @@ export class UsersController {
   @Patch('me')
   async updateMe(@Req() req: any, @Body() dto: UpdateMeDto) {
     return this.usersService.updateMe(req.user.userId, dto);
+  }
+
+  @Patch('me/fcm-token')
+  async updateFcmToken(@Req() req: any, @Body() dto: FcmTokenDto) {
+    return this.usersService.updateFcmToken(req.user.userId, dto.token);
   }
 
   @Get()

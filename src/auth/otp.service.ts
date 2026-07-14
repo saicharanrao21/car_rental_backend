@@ -11,11 +11,11 @@ export class OtpService {
     private readonly prisma: PrismaService,
     private readonly smsProvider: SmsProviderService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
-  ) {}
+  ) { }
 
   async sendOtp(phone: string): Promise<void> {
     const rateLimitKey = `otp:ratelimit:${phone}`;
-    
+
     // Check if the rate limit key exists in Redis
     const isRateLimited = await this.redis.get(rateLimitKey);
     if (isRateLimited) {
@@ -85,7 +85,7 @@ export class OtpService {
         where: { id: latestOtp.id },
         data: { attemptCount: { increment: 1 } },
       });
-      
+
       const attemptsRemaining = 5 - (latestOtp.attemptCount + 1);
       if (attemptsRemaining <= 0) {
         throw new HttpException(

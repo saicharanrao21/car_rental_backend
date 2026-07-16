@@ -200,7 +200,7 @@ export class BookingsService {
       throw new ForbiddenException('Access denied: You are not authorized to view this booking.');
     }
 
-    return booking;
+    return this.redactVendorInBooking(booking, requestingUser);
   }
 
   async getBookingsForCustomer(customerId: string, statusFilter?: BookingStatus, pagination?: PaginationDto) {
@@ -228,8 +228,10 @@ export class BookingsService {
       this.prisma.booking.count({ where }),
     ]);
 
+    const redactedData = this.redactVendorInBooking(data, { userId: customerId, role: Role.CUSTOMER });
+
     return {
-      data,
+      data: redactedData,
       total,
       page,
       totalPages: Math.ceil(total / take),
@@ -451,7 +453,7 @@ export class BookingsService {
         .catch((err) => this.logger.error('Failed to notify vendor of cancellation', err));
     }
 
-    return updatedBooking;
+    return this.redactVendorInBooking(updatedBooking, { userId: customerId, role: Role.CUSTOMER });
   }
 
   async flagDispute(bookingId: string, note: string) {
@@ -512,5 +514,28 @@ export class BookingsService {
     }
 
     return [];
+  }
+
+  private redactVendorInBooking(booking: any, requestingUser: { userId: string; role: Role }) {
+    if (!booking) return booking;
+
+    if (Array.isArray(booking)) {
+      return booking.map((b) => this.redactVendorInBooking(b, requestingUser));
+    }
+
+    if (!booking.vendor) return booking;
+
+    const isAdmin = requestingUser.role === Role.ADMIN;
+    const isVendor = booking.vendor.userId === requestingUser.userId;
+
+    if (!isAdmin && !isVendor) {
+      const copy = { ...booking.vendor };
+      delete copy.gstNumber;
+      delete copy.panNumber;
+      delete copy.bankDetails;
+      booking.vendor = copy;
+    }
+
+    return booking;
   }
 }

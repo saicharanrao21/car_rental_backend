@@ -33,9 +33,12 @@ export class AuthService {
     // 1. Verify OTP first
     await this.otpService.verifyOtp(phone, otp);
 
-    // 2. Check if user already exists
+    // 2. Check if user already exists (include vendor for VENDOR role)
     const user = await this.prisma.user.findUnique({
       where: { phone },
+      include: {
+        vendor: true,
+      },
     });
 
     if (!user) {

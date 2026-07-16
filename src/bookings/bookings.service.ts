@@ -42,37 +42,65 @@ export class BookingsService {
     const lockToken = await this.bookingLockService.acquireLock(dto.carId, start, end);
 
     try {
-      // 2. Perform transactional double-booking check and creation
+      // Fetch car outside of the transaction to do validations and resolve fares
+      const car = await this.prisma.car.findUnique({
+        where: { id: dto.carId },
+        include: { vendor: true },
+      });
+
+      if (!car) {
+        throw new NotFoundException('Car not found.');
+      }
+
+      if (!car.isAvailable) {
+        throw new ConflictException('This car is marked as unavailable.');
+      }
+
+      // Check if tripType is supported by the car
+      if (!car.availableTripTypes.includes(dto.tripType)) {
+        throw new BadRequestException(`This car does not support ${dto.tripType} trip type.`);
+      }
+
+      // Check blockedDates range overlap
+      const hasBlockedDate = car.blockedDates.some((blockedDate) => {
+        const bTime = blockedDate.getTime();
+        return bTime >= start.getTime() && bTime <= end.getTime();
+      });
+
+      if (hasBlockedDate) {
+        throw new ConflictException('The requested date range conflicts with blocked dates for this car.');
+      }
+
+      // 3. Resolve commission percentage outside the transaction
+      const commissionPercent = await this.commissionResolver.resolveCommissionPercent(
+        car.vendor.city,
+        car.type,
+        dto.tripType,
+      );
+
+      // 4. Calculate fare details outside the transaction
+      const durationMs = end.getTime() - start.getTime();
+      let basePackagePrice = new Prisma.Decimal(0);
+
+      if (dto.tripType === TripType.LOCAL || dto.tripType === TripType.AIRPORT_TRANSFER) {
+        const durationHours = Math.ceil(durationMs / (1000 * 60 * 60));
+        basePackagePrice = car.pricePerHour.mul(durationHours);
+      } else {
+        const durationDays = Math.ceil(durationMs / (1000 * 60 * 60 * 24));
+        basePackagePrice = car.pricePerDay.mul(durationDays > 0 ? durationDays : 1);
+      }
+
+      const distance = dto.distanceKm ? new Prisma.Decimal(dto.distanceKm) : new Prisma.Decimal(0);
+      
+      const fareDetails = this.fareCalculator.calculateFare(
+        distance,
+        basePackagePrice,
+        car.pricePerKm,
+        commissionPercent,
+      );
+
+      // 2. Perform transactional double-booking check and creation (with 15s timeout to support slow pg_bouncer pools)
       const booking = await this.prisma.$transaction(async (tx) => {
-        // Fetch car fresh to get latest blockages/availability
-        const car = await tx.car.findUnique({
-          where: { id: dto.carId },
-          include: { vendor: true },
-        });
-
-        if (!car) {
-          throw new NotFoundException('Car not found.');
-        }
-
-        if (!car.isAvailable) {
-          throw new ConflictException('This car is marked as unavailable.');
-        }
-
-        // Check if tripType is supported by the car
-        if (!car.availableTripTypes.includes(dto.tripType)) {
-          throw new BadRequestException(`This car does not support ${dto.tripType} trip type.`);
-        }
-
-        // Check blockedDates range overlap
-        const hasBlockedDate = car.blockedDates.some((blockedDate) => {
-          const bTime = blockedDate.getTime();
-          return bTime >= start.getTime() && bTime <= end.getTime();
-        });
-
-        if (hasBlockedDate) {
-          throw new ConflictException('The requested date range conflicts with blocked dates for this car.');
-        }
-
         // Check overlapping bookings
         const overlappingBooking = await tx.booking.findFirst({
           where: {
@@ -90,34 +118,6 @@ export class BookingsService {
         if (overlappingBooking) {
           throw new ConflictException('This car is already booked during the selected date range.');
         }
-
-        // 3. Resolve commission percentage
-        const commissionPercent = await this.commissionResolver.resolveCommissionPercent(
-          car.vendor.city,
-          car.type,
-          dto.tripType,
-        );
-
-        // 4. Calculate fare
-        const durationMs = end.getTime() - start.getTime();
-        let basePackagePrice = new Prisma.Decimal(0);
-
-        if (dto.tripType === TripType.LOCAL || dto.tripType === TripType.AIRPORT_TRANSFER) {
-          const durationHours = Math.ceil(durationMs / (1000 * 60 * 60));
-          basePackagePrice = car.pricePerHour.mul(durationHours);
-        } else {
-          const durationDays = Math.ceil(durationMs / (1000 * 60 * 60 * 24));
-          basePackagePrice = car.pricePerDay.mul(durationDays > 0 ? durationDays : 1);
-        }
-
-        const distance = dto.distanceKm ? new Prisma.Decimal(dto.distanceKm) : new Prisma.Decimal(0);
-        
-        const fareDetails = this.fareCalculator.calculateFare(
-          distance,
-          basePackagePrice,
-          car.pricePerKm,
-          commissionPercent,
-        );
 
         // 5. Create booking row
         const newBooking = await tx.booking.create({
@@ -152,6 +152,8 @@ export class BookingsService {
         });
 
         return newBooking;
+      }, {
+        timeout: 15000
       });
 
       // After transaction completes, notify vendor

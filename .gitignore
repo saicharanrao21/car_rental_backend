@@ -67,6 +67,14 @@ test_*.js
 test_*.ts
 check_*.js
 check_*.ts
+override_*.js
+override_*.ts
+*_conn.js
+*_conn.ts
+api_test_*.js
+api_test_*.ts
+query_*.js
+query_*.ts
 list_all_bookings.js
 scratch_*.js
 scratch_*.ts

@@ -66,6 +66,13 @@ export class VendorsController {
     return this.vendorsService.getMyBranches(req.user.userId);
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.VENDOR)
+  @Get('me/analytics')
+  async getVendorAnalytics(@Req() req: any) {
+    return this.vendorsService.getVendorAnalytics(req.user.userId);
+  }
+
   // --- Vendor own fleet operations (Must be defined before wildcard GET :id routes) ---
 
   @UseGuards(JwtAuthGuard, RolesGuard)
@@ -156,7 +163,7 @@ export class VendorsController {
   @Post('me/documents')
   @HttpCode(HttpStatus.CREATED)
   async addDocument(@Req() req: any, @Body() dto: CreateDocumentDto) {
-    return this.vendorsService.addDocument(req.user.userId, dto.type, dto.fileUrl, dto.carId);
+    return this.vendorsService.addDocument(req.user.userId, dto.type, dto.fileUrl, dto.carId, dto.expiresAt);
   }
 
   @UseGuards(JwtAuthGuard, RolesGuard)

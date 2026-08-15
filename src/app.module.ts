@@ -25,6 +25,7 @@ import { DepositsModule } from './deposits/deposits.module';
 import { DamageClaimsModule } from './damage-claims/damage-claims.module';
 import { CorrelationIdMiddleware } from './common/correlation-id.middleware';
 
+import { ScheduleModule } from '@nestjs/schedule';
 import { validateEnv } from './common/env.validation';
 
 @Module({
@@ -33,6 +34,7 @@ import { validateEnv } from './common/env.validation';
       isGlobal: true,
       validate: validateEnv,
     }),
+    ScheduleModule.forRoot(),
     PrismaModule,
     RedisModule,
     AuthModule,

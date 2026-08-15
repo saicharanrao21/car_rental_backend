@@ -211,6 +211,57 @@ describe('PaymentsService — Phase 3B Refund & Cancellation Tests', () => {
       expect(result.refundId).toBeNull();
       expect(mockPrisma.payment.update).not.toHaveBeenCalled();
     });
+
+    it('should recover existing refund if payment was already refunded at Razorpay', async () => {
+      mockPrisma.payment.findUnique.mockResolvedValue(mockPaidPayment);
+      mockPrisma.payment.update.mockResolvedValue({
+        ...mockPaidPayment,
+        status: PaymentStatus.REFUNDED,
+        razorpayRefundId: 'rfnd_recovered_999',
+        refundAmount: new Decimal(5000.0),
+        refundStatus: RefundStatus.PROCESSED,
+      });
+
+      const mockRefundFn = jest.fn().mockRejectedValue({
+        statusCode: 400,
+        error: {
+          code: 'BAD_REQUEST_ERROR',
+          description: 'The payment has been fully refunded already',
+        },
+      });
+
+      const mockFetchMultipleFn = jest.fn().mockResolvedValue({
+        count: 1,
+        items: [
+          {
+            id: 'rfnd_recovered_999',
+            status: 'processed',
+            amount: 500000,
+          },
+        ],
+      });
+
+      (service as any).razorpay = {
+        payments: {
+          refund: mockRefundFn,
+          fetchMultipleRefund: mockFetchMultipleFn,
+        },
+      };
+
+      const result = await service.refund(bookingId, 500000);
+      expect(result.refundId).toBe('rfnd_recovered_999');
+      expect(result.refundStatus).toBe(RefundStatus.PROCESSED);
+      expect(mockFetchMultipleFn).toHaveBeenCalledWith(razorpayPaymentId);
+      expect(mockPrisma.payment.update).toHaveBeenCalledWith({
+        where: { id: paymentId },
+        data: {
+          status: PaymentStatus.REFUNDED,
+          razorpayRefundId: 'rfnd_recovered_999',
+          refundAmount: new Decimal(5000.0),
+          refundStatus: RefundStatus.PROCESSED,
+        },
+      });
+    });
   });
 
   describe('handleWebhook — Refund Events', () => {

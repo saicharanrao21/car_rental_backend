@@ -802,10 +802,42 @@ export class PaymentsService {
           initialRefundStatus = RefundStatus.PROCESSED;
         }
       } catch (err: any) {
-        this.logger.error('Razorpay refund API call failed:', err);
-        throw new BadRequestException(
-          `Failed to initiate refund with Razorpay: ${err.message || err}`,
-        );
+        const errorDesc = err?.error?.description || err?.message || String(err);
+        const isAlreadyRefunded =
+          typeof errorDesc === 'string' &&
+          errorDesc.toLowerCase().includes('already');
+
+        if (isAlreadyRefunded) {
+          this.logger.warn(
+            `Payment ${payment.razorpayPaymentId} was already refunded at Razorpay. Fetching existing refund details for idempotent recovery...`,
+          );
+          const refundsList = await (
+            this.razorpay!.payments as any
+          ).fetchMultipleRefund(payment.razorpayPaymentId);
+          if (refundsList && refundsList.items && refundsList.items.length > 0) {
+            const existingRefund = refundsList.items[0];
+            refundId = existingRefund.id;
+            initialRefundStatus =
+              existingRefund.status === 'pending'
+                ? RefundStatus.PENDING
+                : existingRefund.status === 'failed'
+                  ? RefundStatus.FAILED
+                  : RefundStatus.PROCESSED;
+            this.logger.log(
+              `Recovered existing Razorpay refund ${refundId} (status: ${initialRefundStatus}) for booking ${bookingId}`,
+            );
+          } else {
+            this.logger.error('Razorpay refund API call failed:', err);
+            throw new BadRequestException(
+              `Failed to initiate refund with Razorpay: ${errorDesc}`,
+            );
+          }
+        } else {
+          this.logger.error('Razorpay refund API call failed:', err);
+          throw new BadRequestException(
+            `Failed to initiate refund with Razorpay: ${errorDesc}`,
+          );
+        }
       }
     }
 

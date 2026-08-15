@@ -79,7 +79,7 @@ describe('PaymentsService — Phase 3B Refund & Cancellation Tests', () => {
       razorpayRefundId: null,
     };
 
-    it('should successfully execute partial refund (75%) with X-Refund-Idempotency header', async () => {
+    it('should successfully execute partial refund (75%) with receipt idempotency key', async () => {
       mockPrisma.payment.findUnique.mockResolvedValue(mockPaidPayment);
       mockPrisma.payment.update.mockResolvedValue({
         ...mockPaidPayment,
@@ -115,20 +115,16 @@ describe('PaymentsService — Phase 3B Refund & Cancellation Tests', () => {
       expect(result.refundAmount.toNumber()).toBe(3750);
       expect(result.refundStatus).toBe(RefundStatus.PROCESSED);
 
-      expect(mockRefundFn).toHaveBeenCalledWith(
-        razorpayPaymentId,
-        {
-          amount: 375000,
-          notes: {
-            bookingId,
-            reason: 'Moderate cancellation (25% fee)',
-            cancellationTier: 'MODERATE_CANCELLATION',
-          },
+      expect(mockRefundFn).toHaveBeenCalledWith(razorpayPaymentId, {
+        amount: 375000,
+        speed: 'normal',
+        notes: {
+          bookingId,
+          reason: 'Moderate cancellation (25% fee)',
+          cancellationTier: 'MODERATE_CANCELLATION',
         },
-        {
-          'X-Refund-Idempotency': `refund_${bookingId}_${paymentId}`,
-        },
-      );
+        receipt: `refund_${bookingId}_${paymentId}`,
+      });
 
       expect(mockPrisma.payment.update).toHaveBeenCalledWith({
         where: { id: paymentId },

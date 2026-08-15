@@ -782,20 +782,16 @@ export class PaymentsService {
       try {
         const refundResponse: any = await (
           this.razorpay!.payments as any
-        ).refund(
-          payment.razorpayPaymentId,
-          {
-            amount: refundAmountInPaise,
-            notes: {
-              bookingId,
-              reason: reason || 'Booking cancelled',
-              cancellationTier: cancellationTier || 'N/A',
-            },
+        ).refund(payment.razorpayPaymentId, {
+          amount: refundAmountInPaise,
+          speed: 'normal',
+          notes: {
+            bookingId,
+            reason: reason || 'Booking cancelled',
+            cancellationTier: cancellationTier || 'N/A',
           },
-          {
-            'X-Refund-Idempotency': idempotencyKey,
-          },
-        );
+          receipt: idempotencyKey,
+        });
 
         refundId = refundResponse.id;
         if (refundResponse.status === 'pending') {
@@ -859,8 +855,19 @@ export class PaymentsService {
       );
     }
 
-    return this.prisma.payment.findUnique({
+    const payment = await this.prisma.payment.findUnique({
       where: { bookingId },
     });
+
+    if (!payment) {
+      return null;
+    }
+
+    return {
+      ...payment,
+      keyId: this.keyId,
+      currency: 'INR',
+      amountInPaise: Math.round(payment.amount.toNumber() * 100),
+    };
   }
 }

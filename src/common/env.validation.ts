@@ -128,6 +128,18 @@ export class EnvironmentVariables {
   @IsNumber()
   @IsOptional()
   STALE_PAYMENT_ORDER_HOURS?: number = 24;
+
+  @IsString()
+  @IsOptional()
+  SENTRY_DSN?: string;
+
+  @IsString()
+  @IsOptional()
+  SENTRY_ENVIRONMENT?: string;
+
+  @IsString()
+  @IsOptional()
+  SENTRY_RELEASE?: string;
 }
 
 const KNOWN_PLACEHOLDER_SECRETS = new Set([

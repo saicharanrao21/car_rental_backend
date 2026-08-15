@@ -1,9 +1,10 @@
-import { Injectable, Logger, Inject } from '@nestjs/common';
+import { Injectable, Logger, Inject, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { AuditLogService } from '../admin/audit-log.service';
+import { ApmMonitoringService } from '../common/apm-monitoring.service';
 import { REDIS_CLIENT } from '../redis/redis.constants';
 import Redis from 'ioredis';
 import Razorpay from 'razorpay';
@@ -40,6 +41,7 @@ export class FinancialReconciliationService {
     private readonly notificationsService: NotificationsService,
     private readonly auditLogService: AuditLogService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
+    @Optional() private readonly apmMonitoringService?: ApmMonitoringService,
   ) {
     this.useMock =
       this.configService.get<string>('RAZORPAY_USE_MOCK') === 'true';
@@ -723,6 +725,24 @@ export class FinancialReconciliationService {
             'Booking cancelled with expected refund but payment is PAID without gateway refund',
         },
       });
+
+      if (this.apmMonitoringService) {
+        this.apmMonitoringService.captureFinancialInconsistency(
+          `Booking ${booking.id} is CANCELLED with expected refund of INR ${booking.refundAmount}, but Payment ${payment.id} remains PAID and no gateway refund exists on Razorpay!`,
+          {
+            bookingId: booking.id,
+            paymentId: payment.id,
+            razorpayPaymentId: payment.razorpayPaymentId || undefined,
+            expectedAmount: booking.refundAmount?.toNumber(),
+            severity: 'fatal',
+            extra: {
+              status: booking.status,
+              paymentStatus: payment.status,
+              refundStatus: payment.refundStatus,
+            },
+          },
+        );
+      }
 
       report.errors++;
     }

@@ -74,4 +74,12 @@ export class CreateCarDto {
   @IsArray()
   @IsString({ each: true })
   availableTripTypes?: string[] = [];
+
+  @IsOptional()
+  @IsString()
+  pickupHubId?: string;
+
+  @IsOptional()
+  @IsString()
+  serviceAreaId?: string;
 }

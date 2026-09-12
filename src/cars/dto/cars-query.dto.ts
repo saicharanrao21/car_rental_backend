@@ -1,10 +1,12 @@
 import {
   IsBoolean,
   IsEnum,
+  IsISO8601,
   IsNumber,
   IsOptional,
   IsString,
   Min,
+  Max,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { PaginationDto } from '../../common/pagination.dto';
@@ -35,6 +37,10 @@ export class CarsQueryDto extends PaginationDto {
   lng?: number;
 
   @IsOptional()
+  @IsString()
+  serviceAreaId?: string;
+
+  @IsOptional()
   @IsEnum(CarCategory)
   carType?: CarCategory;
 
@@ -63,9 +69,43 @@ export class CarsQueryDto extends PaginationDto {
 
   @IsOptional()
   @IsString()
+  pickupHubId?: string;
+
+  @IsOptional()
+  @IsString()
   tripType?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  @Max(150)
+  radiusKm?: number;
+
+  @IsOptional()
+  @IsString()
+  fuelType?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  seating?: number;
+
+  @IsOptional()
+  @Type(() => Boolean)
+  @IsBoolean()
+  featuredOnly?: boolean;
 
   @IsOptional()
   @IsEnum(SortByOption)
   sortBy?: SortByOption = SortByOption.RECOMMENDED;
+
+  @IsOptional()
+  @IsISO8601()
+  startDate?: string;
+
+  @IsOptional()
+  @IsISO8601()
+  endDate?: string;
 }

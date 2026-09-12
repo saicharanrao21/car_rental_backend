@@ -38,22 +38,46 @@ async function bootstrap() {
 
   // Environment-driven CORS configuration
   const rawCors = configService.get<string>('CORS_ALLOWED_ORIGINS');
-  const allowedOrigins: string[] = rawCors
-    ? rawCors
-        .split(',')
-        .map((origin) => origin.trim())
-        .filter(Boolean)
-    : [
-        'http://localhost:8080',
-        'http://localhost:8085',
-        'http://localhost:3000',
-        'http://127.0.0.1:8080',
-        'http://127.0.0.1:8085',
-        'http://127.0.0.1:3000',
-      ];
+  const allowedOrigins: string[] =
+    rawCors && rawCors.trim().length > 0
+      ? rawCors
+          .split(',')
+          .map((origin) => origin.trim())
+          .filter(Boolean)
+      : [
+          'http://localhost:8080',
+          'http://localhost:8085',
+          'http://localhost:8088',
+          'http://localhost:3000',
+          'http://127.0.0.1:8080',
+          'http://127.0.0.1:8085',
+          'http://127.0.0.1:8088',
+          'http://127.0.0.1:3000',
+        ];
+
+  const isProduction = configService.get<string>('NODE_ENV') === 'production';
 
   app.enableCors({
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, server-to-server)
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin) || origin.endsWith('.drivego.in')) {
+        return callback(null, true);
+      }
+
+      if (!isProduction) {
+        if (
+          origin.includes('localhost') ||
+          origin.includes('127.0.0.1') ||
+          origin.endsWith('.onrender.com')
+        ) {
+          return callback(null, true);
+        }
+      }
+
+      return callback(new Error(`CORS policy: Origin ${origin} is not allowed`));
+    },
     credentials: true,
   });
 
@@ -65,6 +89,8 @@ async function bootstrap() {
     }),
   );
   app.useGlobalInterceptors(new ExcludePasswordHashInterceptor());
+
+  app.enableShutdownHooks();
 
   await app.listen(process.env.PORT || 3000, '0.0.0.0');
 }

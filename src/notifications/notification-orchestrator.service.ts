@@ -1,0 +1,888 @@
+import {
+  Injectable,
+  Logger,
+  Optional,
+  NotFoundException,
+  BadRequestException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { FcmService } from './fcm.service';
+import { SmsProvider } from './providers/sms-provider.service';
+import { EmailProvider } from './providers/email-provider.service';
+import { WhatsAppProvider } from '../whatsapp/whatsapp-provider.service';
+import { QueueProducerService } from '../queues/queue-producer.service';
+import { NotificationRealtimeService } from './notification-realtime.service';
+import {
+  NotificationTemplateEngine,
+  OperationalEventType,
+  TemplateVariables,
+  RenderedNotificationPayload,
+} from './templates/notification-templates';
+import {
+  NotificationChannel,
+  DeliveryStatus,
+  NotificationPriority,
+  Prisma,
+} from '@prisma/client';
+import { IntegrationRuntimeService } from '../integrations/runtime/integration-runtime.service';
+import { IntegrationCategory } from '../integrations/registry/provider.types';
+import { CommunicationDispatcherService } from '../integrations/communications/communication-dispatcher.service';
+import {
+  CommunicationChannel as CommChannel,
+  CommunicationMessageType,
+  CommunicationPriority as CommPriority,
+} from '../integrations/communications/communication.types';
+
+export interface OperationalEventVariables {
+  customerName?: string;
+  vendorName?: string;
+  bookingId?: string;
+  vehicleName?: string;
+  registrationNumber?: string;
+  pickupTime?: string;
+  returnTime?: string;
+  pickupAddress?: string;
+  returnAddress?: string;
+  deliveryFee?: number | string;
+  paymentAmount?: number | string;
+  refundAmount?: number | string;
+  supportContact?: string;
+  etaMinutes?: number | string;
+  damageSeverity?: string;
+  [key: string]: any;
+}
+
+export interface PublishOperationalEventDto {
+  eventType: string;
+  recipientId: string;
+  entityType: string;
+  entityId: string;
+  variables: OperationalEventVariables;
+  priority?: NotificationPriority;
+  channels?: NotificationChannel[];
+  isTransactional?: boolean;
+  idempotencyKey?: string;
+}
+
+export interface DeliveryQueryFilter {
+  page?: number;
+  limit?: number;
+  channel?: NotificationChannel;
+  status?: DeliveryStatus;
+  recipient?: string;
+  notificationId?: string;
+}
+
+export type DeliveryQueryDto = DeliveryQueryFilter;
+
+@Injectable()
+export class NotificationOrchestratorService {
+  private readonly logger = new Logger(NotificationOrchestratorService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly fcmService: FcmService,
+    private readonly smsProvider: SmsProvider,
+    private readonly emailProvider: EmailProvider,
+    @Optional() private readonly whatsappProvider?: WhatsAppProvider,
+    @Optional() private readonly queueProducer?: QueueProducerService,
+    @Optional() private readonly realtimeService?: NotificationRealtimeService,
+    @Optional() private readonly runtimeService?: IntegrationRuntimeService,
+    @Optional() private readonly communicationDispatcher?: CommunicationDispatcherService,
+  ) {}
+
+  /**
+   * Publishes an operational lifecycle event to all eligible channels.
+   * Enforces server-side deduplication, recipient resolution, template rendering, and delivery tracking.
+   */
+  async publishEvent(dto: PublishOperationalEventDto) {
+    const {
+      eventType,
+      recipientId,
+      entityType,
+      entityId,
+      variables,
+      priority: overridePriority,
+      channels: overrideChannels,
+      isTransactional = true,
+    } = dto;
+
+    // 1. Resolve Recipient User & Contact Info
+    const user = await this.prisma.user.findUnique({
+      where: { id: recipientId },
+      select: { id: true, name: true, phone: true, email: true },
+    });
+
+    if (!user) {
+      this.logger.warn(`[NOTIF-ORCHESTRATOR] Recipient user ${recipientId} not found. Skipping.`);
+      return null;
+    }
+
+    // Enhance variables with user name if not present
+    const enrichedVars: TemplateVariables = {
+      customerName: user.name || 'Customer',
+      ...variables,
+    };
+
+    // 2. Render Canonical Template
+    const rendered = NotificationTemplateEngine.render(
+      eventType as OperationalEventType,
+      enrichedVars,
+    );
+    const priority = (overridePriority || rendered.priority) as NotificationPriority;
+
+    // 3. Generate Deterministic Idempotency Key
+    const idempotencyKey =
+      dto.idempotencyKey ||
+      `evt_${eventType}_${entityId || 'none'}_${recipientId}`;
+
+    // 4. Permanent Idempotency Check (Database Uniqueness)
+    const existing = await this.prisma.notification.findUnique({
+      where: { idempotencyKey },
+      include: { deliveries: true },
+    });
+
+    if (existing) {
+      this.logger.log(
+        `[NOTIF-ORCHESTRATOR] Idempotent notification hit for key: ${idempotencyKey}. Returning existing record.`,
+      );
+      return existing;
+    }
+
+    // 5. Check User Channel Preferences
+    const prefs = await this.getUserPreferences(recipientId);
+
+    // Determine enabled channels
+    const channelsToDispatch: NotificationChannel[] = overrideChannels || [
+      NotificationChannel.IN_APP,
+      ...(isTransactional || prefs.promotionalPush ? [NotificationChannel.PUSH] : []),
+      ...((isTransactional ? prefs.operationalSms : prefs.promotionalSms) && user.phone
+        ? [NotificationChannel.SMS]
+        : []),
+      ...((isTransactional ? prefs.operationalWhatsApp : prefs.promotionalWhatsApp) && user.phone
+        ? [NotificationChannel.WHATSAPP]
+        : []),
+      ...((isTransactional ? prefs.operationalEmail : prefs.promotionalEmail) && user.email
+        ? [NotificationChannel.EMAIL]
+        : []),
+    ];
+
+    // 6. Synchronously Persist Canonical In-App Notification (Single Source of Truth)
+    const notification = await this.prisma.notification.create({
+      data: {
+        userId: recipientId,
+        title: rendered.title,
+        body: rendered.body,
+        category: rendered.category,
+        eventType,
+        entityType,
+        entityId,
+        actionUrl: rendered.actionUrl,
+        priority,
+        idempotencyKey,
+        metadata: variables as any,
+        isRead: false,
+      },
+    });
+
+    // Broadcast live event to authenticated user via SSE stream
+    if (this.realtimeService) {
+      this.realtimeService.emitToUser(recipientId, 'notification', notification);
+      this.prisma.notification
+        .count({ where: { userId: recipientId, isRead: false } })
+        .then((cnt) =>
+          this.realtimeService?.emitToUser(recipientId, 'unread_count', {
+            unreadCount: cnt,
+          }),
+        )
+        .catch(() => {});
+    }
+
+    // 7. Create NotificationDelivery Records and Dispatch to Channels
+    const deliveries: any[] = [];
+
+    for (const channel of channelsToDispatch) {
+      const channelIdempotencyKey = `${idempotencyKey}_${channel}`;
+      const recipientTarget =
+        channel === NotificationChannel.SMS || channel === NotificationChannel.WHATSAPP
+          ? user.phone || recipientId
+          : channel === NotificationChannel.EMAIL
+            ? user.email || recipientId
+            : recipientId;
+
+      const delivery = await this.prisma.notificationDelivery.create({
+        data: {
+          notificationId: notification.id,
+          channel,
+          status:
+            channel === NotificationChannel.IN_APP
+              ? DeliveryStatus.DELIVERED
+              : DeliveryStatus.QUEUED,
+          recipient: recipientTarget,
+          provider:
+            channel === NotificationChannel.PUSH
+              ? 'FCM'
+              : channel === NotificationChannel.SMS
+                ? 'TWILIO'
+                : channel === NotificationChannel.WHATSAPP
+                  ? 'META'
+                  : channel === NotificationChannel.EMAIL
+                    ? 'SMTP'
+                    : 'IN_APP',
+          idempotencyKey: channelIdempotencyKey,
+          deliveredAt: channel === NotificationChannel.IN_APP ? new Date() : null,
+          metadata: {
+            eventType,
+            priority,
+          },
+        },
+      });
+
+      deliveries.push(delivery);
+
+      // Asynchronously trigger channel dispatch
+      this.dispatchChannel(channel, delivery.id, recipientId, user, rendered).catch(
+        (err) => {
+          this.logger.error(
+            `[CHANNEL-DISPATCH-ERROR] Failed to dispatch channel ${channel} for delivery ${delivery.id}: ${err?.message}`,
+          );
+        },
+      );
+    }
+
+    return {
+      ...notification,
+      deliveries,
+    };
+  }
+
+  // ── Asynchronous Channel Dispatcher ───────────────────────────────────────
+
+  private async dispatchChannel(
+    channel: NotificationChannel,
+    deliveryId: string,
+    recipientId: string,
+    user: { id: string; name: string | null; phone: string | null; email: string | null },
+    rendered: RenderedNotificationPayload,
+  ) {
+    switch (channel) {
+      case NotificationChannel.IN_APP:
+        // Already marked DELIVERED upon creation
+        break;
+
+      case NotificationChannel.PUSH:
+        if (this.communicationDispatcher) {
+          try {
+            // Query real registered and active device tokens for the recipient
+            const userDevices = await this.prisma.userDevice.findMany({
+              where: {
+                userId: recipientId,
+                isActive: true,
+              },
+              select: {
+                id: true,
+                token: true,
+              },
+            });
+
+            let realDeviceTokens = userDevices.map((d) => d.token).filter(Boolean);
+
+            // Legacy fallback if no user devices in table
+            if (realDeviceTokens.length === 0) {
+              const legacyUser = await this.prisma.user.findUnique({
+                where: { id: recipientId },
+                select: { fcmToken: true },
+              });
+              if (legacyUser?.fcmToken) {
+                realDeviceTokens = [legacyUser.fcmToken];
+              }
+            }
+
+            if (realDeviceTokens.length === 0) {
+              this.logger.debug(
+                `[NOTIF-ORCHESTRATOR] No active device tokens found for recipient ${recipientId}. Skipping PUSH dispatch.`,
+              );
+              await this.prisma.notificationDelivery.update({
+                where: { id: deliveryId },
+                data: {
+                  status: DeliveryStatus.FAILED,
+                  lastError: 'No active device tokens registered for recipient',
+                  failedAt: new Date(),
+                  attemptCount: { increment: 1 },
+                },
+              });
+              break;
+            }
+
+            const res = await this.communicationDispatcher.dispatchCommunication({
+              channel: CommChannel.PUSH,
+              messageType: CommunicationMessageType.TRANSACTIONAL,
+              priority: CommPriority.NORMAL,
+              recipient: {
+                id: recipientId,
+                deviceTokens: realDeviceTokens,
+              },
+              directContent: {
+                subject: rendered.title,
+                body: rendered.body,
+                data: {
+                  actionUrl: rendered.actionUrl || '',
+                  category: rendered.category,
+                },
+              },
+              idempotencyKey: `notif_push_${deliveryId}`,
+            });
+
+            // If any token was rejected as invalid or unregistered by FCM, deactivate in DB
+            if (!res.success && res.error && (res.error.includes('registration-token-not-registered') || res.error.includes('invalid-registration-token'))) {
+              await this.prisma.userDevice.updateMany({
+                where: {
+                  userId: recipientId,
+                  token: { in: realDeviceTokens },
+                },
+                data: { isActive: false },
+              });
+            }
+
+            await this.prisma.notificationDelivery.update({
+              where: { id: deliveryId },
+              data: {
+                status: res.success ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED,
+                provider: res.providerId || 'FCM',
+                providerMessageId: res.providerMessageId || null,
+                deliveredAt: res.success ? new Date() : null,
+                failedAt: !res.success ? new Date() : null,
+                lastError: res.error || null,
+                attemptCount: { increment: 1 },
+              },
+            });
+            break;
+          } catch (e: any) {
+            this.logger.debug(`[NOTIF-ORCHESTRATOR] Enterprise push bypass: ${e?.message}`);
+          }
+        }
+        if (this.queueProducer) {
+          await this.queueProducer.dispatchPushNotification({
+            userId: recipientId,
+            title: rendered.title,
+            body: rendered.body,
+            data: {
+              actionUrl: rendered.actionUrl || '',
+              category: rendered.category,
+            },
+            correlationId: deliveryId,
+          });
+        } else {
+          // Direct execution fallback
+          await this.executePushDelivery(deliveryId, recipientId, rendered.title, rendered.body, {
+            actionUrl: rendered.actionUrl || '',
+            category: rendered.category,
+          });
+        }
+        break;
+
+      case NotificationChannel.SMS:
+        if (user.phone) {
+          if (this.communicationDispatcher) {
+            try {
+              const res = await this.communicationDispatcher.dispatchCommunication({
+                channel: CommChannel.SMS,
+                messageType: CommunicationMessageType.TRANSACTIONAL,
+                priority: CommPriority.HIGH,
+                recipient: {
+                  phone: user.phone,
+                  name: user.name || 'Customer',
+                },
+                directContent: {
+                  body: rendered.smsText,
+                },
+                idempotencyKey: `notif_sms_${deliveryId}`,
+              });
+              await this.prisma.notificationDelivery.update({
+                where: { id: deliveryId },
+                data: {
+                  status: res.success ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED,
+                  provider: res.providerId || 'TWILIO',
+                  providerMessageId: res.providerMessageId || null,
+                  deliveredAt: res.success ? new Date() : null,
+                  failedAt: !res.success ? new Date() : null,
+                  lastError: res.error || null,
+                  attemptCount: { increment: 1 },
+                },
+              });
+              break;
+            } catch (e: any) {
+              this.logger.debug(`[NOTIF-ORCHESTRATOR] Enterprise SMS bypass: ${e?.message}`);
+            }
+          }
+          if (this.queueProducer) {
+            await this.queueProducer.dispatchSmsNotification({
+              phone: user.phone,
+              message: rendered.smsText,
+              correlationId: deliveryId,
+            });
+          } else {
+            // Direct execution fallback
+            await this.executeSmsDelivery(deliveryId, user.phone, rendered.smsText);
+          }
+        }
+        break;
+
+      case NotificationChannel.WHATSAPP:
+        if (user.phone) {
+          const params = [
+            user.name || 'Valued Customer',
+            rendered.title,
+            rendered.body,
+          ];
+          if (this.communicationDispatcher) {
+            try {
+              const res = await this.communicationDispatcher.dispatchCommunication({
+                channel: CommChannel.WHATSAPP,
+                messageType: CommunicationMessageType.TRANSACTIONAL,
+                priority: CommPriority.HIGH,
+                recipient: {
+                  phone: user.phone,
+                  name: user.name || 'Customer',
+                },
+                template: {
+                  templateName: 'booking_operational_alert',
+                  language: 'en',
+                  variables: {
+                    param1: params[0],
+                    param2: params[1],
+                    param3: params[2],
+                  },
+                },
+                idempotencyKey: `notif_wa_${deliveryId}`,
+              });
+              await this.prisma.notificationDelivery.update({
+                where: { id: deliveryId },
+                data: {
+                  status: res.success ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED,
+                  provider: res.providerId || 'META_WHATSAPP',
+                  providerMessageId: res.providerMessageId || null,
+                  deliveredAt: res.success ? new Date() : null,
+                  failedAt: !res.success ? new Date() : null,
+                  lastError: res.error || null,
+                  attemptCount: { increment: 1 },
+                },
+              });
+              break;
+            } catch (e: any) {
+              this.logger.debug(`[NOTIF-ORCHESTRATOR] Enterprise WhatsApp bypass: ${e?.message}`);
+            }
+          }
+          if (this.queueProducer) {
+            await this.queueProducer.dispatchWhatsAppNotification({
+              phone: user.phone,
+              templateName: 'booking_operational_alert',
+              bodyParameters: params,
+              userId: recipientId,
+              correlationId: deliveryId,
+            });
+          } else {
+            // Direct execution fallback
+            await this.executeWhatsAppDelivery(
+              deliveryId,
+              user.phone,
+              'booking_operational_alert',
+              params,
+            );
+          }
+        }
+        break;
+
+      case NotificationChannel.EMAIL:
+        if (user.email) {
+          if (this.communicationDispatcher) {
+            try {
+              const res = await this.communicationDispatcher.dispatchCommunication({
+                channel: CommChannel.EMAIL,
+                messageType: CommunicationMessageType.TRANSACTIONAL,
+                priority: CommPriority.NORMAL,
+                recipient: {
+                  email: user.email,
+                  name: user.name || 'Customer',
+                },
+                directContent: {
+                  subject: rendered.emailSubject,
+                  html: rendered.emailHtml,
+                  body: rendered.smsText,
+                },
+                idempotencyKey: `notif_email_${deliveryId}`,
+              });
+              await this.prisma.notificationDelivery.update({
+                where: { id: deliveryId },
+                data: {
+                  status: res.success ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED,
+                  provider: res.providerId || 'RESEND',
+                  providerMessageId: res.providerMessageId || null,
+                  deliveredAt: res.success ? new Date() : null,
+                  failedAt: !res.success ? new Date() : null,
+                  lastError: res.error || null,
+                  attemptCount: { increment: 1 },
+                },
+              });
+              break;
+            } catch (e: any) {
+              this.logger.debug(`[NOTIF-ORCHESTRATOR] Enterprise Email bypass: ${e?.message}`);
+            }
+          }
+          if (this.queueProducer) {
+            await this.queueProducer.dispatchEmailNotification({
+              to: user.email,
+              subject: rendered.emailSubject,
+              htmlContent: rendered.emailHtml,
+              correlationId: deliveryId,
+            });
+          } else {
+            // Direct execution fallback
+            await this.executeEmailDelivery(
+              deliveryId,
+              user.email,
+              rendered.emailSubject,
+              rendered.emailHtml,
+            );
+          }
+        }
+        break;
+    }
+  }
+
+  // ── Direct Execution Workers (used directly or by BullMQ processor) ───────
+
+  async executePushDelivery(
+    deliveryId: string,
+    userId: string,
+    title: string,
+    body: string,
+    data?: Record<string, string>,
+  ) {
+    try {
+      const result = await this.fcmService.sendToUser(userId, title, body, data);
+      await this.prisma.notificationDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: result?.success !== false ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED,
+          providerMessageId: result?.messageId || null,
+          deliveredAt: result?.success !== false ? new Date() : null,
+          failedAt: result?.success === false ? new Date() : null,
+          lastError: result?.error || null,
+          attemptCount: { increment: 1 },
+        },
+      });
+      if (result?.success === false) {
+        await this.checkDeadLetterThreshold(deliveryId);
+      }
+      return result;
+    } catch (err: any) {
+      await this.recordDeliveryFailure(deliveryId, err?.message);
+      throw err;
+    }
+  }
+
+  async executeSmsDelivery(deliveryId: string, phone: string, message: string) {
+    try {
+      const result = await this.smsProvider.sendSms(phone, message);
+      await this.prisma.notificationDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: result.success ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED,
+          providerMessageId: result.messageId || null,
+          deliveredAt: result.success ? new Date() : null,
+          failedAt: !result.success ? new Date() : null,
+          lastError: result.error || null,
+          attemptCount: { increment: 1 },
+        },
+      });
+      if (!result.success) {
+        await this.checkDeadLetterThreshold(deliveryId, result.isTransient);
+      }
+      return result;
+    } catch (err: any) {
+      await this.recordDeliveryFailure(deliveryId, err?.message);
+      throw err;
+    }
+  }
+
+  async executeWhatsAppDelivery(
+    deliveryId: string,
+    phone: string,
+    templateName: string,
+    params: string[],
+  ) {
+    try {
+      if (this.runtimeService) {
+        try {
+          const runtimeRes = await this.runtimeService.execute({
+            category: IntegrationCategory.MESSAGING_WHATSAPP,
+            capability: 'SEND_TEMPLATE',
+            payload: {
+              to: phone,
+              templateName,
+              language: 'en_US',
+              bodyParameters: params,
+            },
+            idempotencyKey: `notif_wa_${deliveryId}`,
+            isIdempotent: true,
+          });
+          if (runtimeRes.success) {
+            const resData = runtimeRes.data as any;
+            await this.prisma.notificationDelivery.update({
+              where: { id: deliveryId },
+              data: {
+                status: DeliveryStatus.DELIVERED,
+                providerMessageId: resData?.providerMessageId || `wa_${Date.now()}`,
+                deliveredAt: new Date(),
+                attemptCount: { increment: 1 },
+              },
+            });
+            return { success: true, messageId: resData?.providerMessageId };
+          }
+        } catch (rErr: any) {
+          this.logger.warn(`Integration runtime whatsapp failed, falling back: ${rErr.message}`);
+        }
+      }
+
+      if (!this.whatsappProvider) {
+        this.logger.warn(`[NOTIF-ORCHESTRATOR] WhatsAppProvider not available. Skipping.`);
+        return { success: true };
+      }
+      const result = await this.whatsappProvider.sendMessage(
+        phone,
+        templateName,
+        'en_US',
+        params,
+      );
+
+      const isAccepted = result.status === 'ACCEPTED';
+      await this.prisma.notificationDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: isAccepted ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED,
+          providerMessageId: result.providerMessageId,
+          deliveredAt: isAccepted ? new Date() : null,
+          failedAt: !isAccepted ? new Date() : null,
+          lastError: result.errorMessage || null,
+          attemptCount: { increment: 1 },
+        },
+      });
+      if (!isAccepted) {
+        await this.checkDeadLetterThreshold(deliveryId, false);
+      }
+      return { success: isAccepted, messageId: result.providerMessageId, error: result.errorMessage };
+    } catch (err: any) {
+      await this.recordDeliveryFailure(deliveryId, err?.message);
+      throw err;
+    }
+  }
+
+  async executeEmailDelivery(
+    deliveryId: string,
+    to: string,
+    subject: string,
+    html: string,
+  ) {
+    try {
+      const result = await this.emailProvider.sendEmail(to, subject, html);
+      await this.prisma.notificationDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: result.success ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED,
+          providerMessageId: result.messageId || null,
+          deliveredAt: result.success ? new Date() : null,
+          failedAt: !result.success ? new Date() : null,
+          lastError: result.error || null,
+          attemptCount: { increment: 1 },
+        },
+      });
+      if (!result.success) {
+        await this.checkDeadLetterThreshold(deliveryId, result.isTransient);
+      }
+      return result;
+    } catch (err: any) {
+      await this.recordDeliveryFailure(deliveryId, err?.message);
+      throw err;
+    }
+  }
+
+  private async checkDeadLetterThreshold(deliveryId: string, isTransient = true) {
+    try {
+      const existing = await this.prisma.notificationDelivery.findUnique({
+        where: { id: deliveryId },
+      });
+      if (!existing) return;
+      if (!isTransient || existing.attemptCount >= existing.maxRetries) {
+        await this.prisma.notificationDelivery.update({
+          where: { id: deliveryId },
+          data: { status: DeliveryStatus.DEAD_LETTER },
+        });
+      }
+    } catch {
+      // Non-blocking dead-letter check
+    }
+  }
+
+  private async recordDeliveryFailure(deliveryId: string, errorMessage?: string) {
+    try {
+      const existing = await this.prisma.notificationDelivery.findUnique({
+        where: { id: deliveryId },
+      });
+
+      const nextAttempt = (existing?.attemptCount ?? 0) + 1;
+      const isExhausted = nextAttempt >= (existing?.maxRetries ?? 3);
+
+      await this.prisma.notificationDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: isExhausted ? DeliveryStatus.DEAD_LETTER : DeliveryStatus.FAILED,
+          attemptCount: nextAttempt,
+          lastError: errorMessage || 'Channel delivery failed',
+          failedAt: new Date(),
+        },
+      });
+    } catch {
+      // Best effort failure recording
+    }
+  }
+
+  // ── User Preference Resolution ────────────────────────────────────────────
+
+  private async getUserPreferences(userId: string) {
+    let prefs = await this.prisma.notificationPreference.findUnique({
+      where: { userId },
+    });
+
+    if (!prefs) {
+      prefs = await this.prisma.notificationPreference.create({
+        data: { userId },
+      });
+    }
+
+    return prefs;
+  }
+
+  // ── Admin Delivery Telemetry & Observability ──────────────────────────────
+
+  async getDeliveries(query: DeliveryQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.NotificationDeliveryWhereInput = {};
+    if (query.channel) where.channel = query.channel;
+    if (query.status) where.status = query.status;
+    if (query.recipient) {
+      where.recipient = { contains: query.recipient, mode: 'insensitive' };
+    }
+    if (query.notificationId) where.notificationId = query.notificationId;
+
+    const [items, total] = await Promise.all([
+      this.prisma.notificationDelivery.findMany({
+        where,
+        include: {
+          notification: {
+            select: {
+              title: true,
+              eventType: true,
+              category: true,
+              userId: true,
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      this.prisma.notificationDelivery.count({ where }),
+    ]);
+
+    return {
+      items,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  async getDeliveryStats() {
+    const [total, delivered, failed, deadLetter, queued] = await Promise.all([
+      this.prisma.notificationDelivery.count(),
+      this.prisma.notificationDelivery.count({ where: { status: DeliveryStatus.DELIVERED } }),
+      this.prisma.notificationDelivery.count({ where: { status: DeliveryStatus.FAILED } }),
+      this.prisma.notificationDelivery.count({ where: { status: DeliveryStatus.DEAD_LETTER } }),
+      this.prisma.notificationDelivery.count({ where: { status: DeliveryStatus.QUEUED } }),
+    ]);
+
+    const channelStats = await this.prisma.notificationDelivery.groupBy({
+      by: ['channel', 'status'],
+      _count: { id: true },
+    });
+
+    return {
+      overview: {
+        total,
+        delivered,
+        failed,
+        deadLetter,
+        queued,
+        deliveryRate: total > 0 ? ((delivered / total) * 100).toFixed(1) + '%' : '100%',
+      },
+      channelBreakdown: channelStats,
+    };
+  }
+
+  async retryDelivery(deliveryId: string) {
+    const delivery = await this.prisma.notificationDelivery.findUnique({
+      where: { id: deliveryId },
+      include: { notification: true },
+    });
+
+    if (!delivery) {
+      throw new NotFoundException(`Notification delivery ${deliveryId} not found.`);
+    }
+
+    if (delivery.status === DeliveryStatus.DELIVERED) {
+      throw new BadRequestException(`Delivery ${deliveryId} is already marked DELIVERED.`);
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: delivery.notification.userId },
+      select: { id: true, name: true, phone: true, email: true },
+    });
+
+    if (!user) {
+      throw new NotFoundException(`User for delivery ${deliveryId} not found.`);
+    }
+
+    const rendered = NotificationTemplateEngine.render(
+      (delivery.notification.eventType as OperationalEventType) || 'BOOKING_CONFIRMED',
+      {
+        customerName: user.name || 'Customer',
+        bookingId: delivery.notification.entityId || '',
+        ...(delivery.notification.metadata as any),
+      },
+    );
+
+    // Reset status to QUEUED
+    await this.prisma.notificationDelivery.update({
+      where: { id: deliveryId },
+      data: {
+        status: DeliveryStatus.QUEUED,
+        lastError: null,
+      },
+    });
+
+    // Re-dispatch
+    await this.dispatchChannel(
+      delivery.channel,
+      delivery.id,
+      delivery.notification.userId,
+      user,
+      rendered,
+    );
+
+    return { success: true, deliveryId, status: 'QUEUED' };
+  }
+}

@@ -1,8 +1,10 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import * as crypto from 'crypto';
+import { IntegrationRuntimeService } from '../integrations/runtime/integration-runtime.service';
+import { IntegrationCategory } from '../integrations/registry/provider.types';
 
 @Injectable()
 export class UploadsService {
@@ -11,7 +13,10 @@ export class UploadsService {
   private readonly bucketName: string;
   private readonly publicUrl: string;
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    @Optional() private readonly runtimeService?: IntegrationRuntimeService,
+  ) {
     this.useMock = this.configService.get<string>('R2_USE_MOCK') === 'true';
     this.bucketName =
       this.configService.get<string>('R2_BUCKET_NAME') || 'drivego-uploads';
@@ -25,6 +30,17 @@ export class UploadsService {
     ) {
       throw new Error(
         'CRITICAL SECURITY CONFIGURATION ERROR: R2_USE_MOCK is set to true, but NODE_ENV is production! Localhost mock file uploads are forbidden in production.',
+      );
+    }
+
+    if (
+      !this.useMock &&
+      this.configService.get<string>('R2_PUBLIC_URL') &&
+      this.publicUrl.includes('placeholder') &&
+      this.configService.get<string>('NODE_ENV') === 'production'
+    ) {
+      throw new Error(
+        'CRITICAL SECURITY CONFIGURATION ERROR: R2_PUBLIC_URL must be configured with a real domain in production.',
       );
     }
 
@@ -58,7 +74,8 @@ export class UploadsService {
       | 'vendor-document'
       | 'profile-photo'
       | 'banner'
-      | 'inspection-photo',
+      | 'inspection-photo'
+      | 'damage-claim',
     contentType: string,
     userId: string,
   ) {
@@ -83,7 +100,9 @@ export class UploadsService {
     const filename = `${crypto.randomUUID()}.${ext}`;
     const key = `${fileType}/${userId}/${filename}`;
     const isPrivate =
-      fileType === 'vendor-document' || fileType === 'inspection-photo';
+      fileType === 'vendor-document' ||
+      fileType === 'inspection-photo' ||
+      fileType === 'damage-claim';
 
     if (this.useMock) {
       // In local dev mock mode, return local endpoints for upload/read simulation

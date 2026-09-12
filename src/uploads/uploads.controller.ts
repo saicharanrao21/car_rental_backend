@@ -9,11 +9,13 @@ import {
   Req,
   Res,
   NotFoundException,
+  BadRequestException,
   HttpStatus,
 } from '@nestjs/common';
 import { UploadsService } from './uploads.service';
 import { PresignUploadDto } from './dto/presign-upload.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RateLimit } from '../common/decorators/rate-limit.decorator';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -23,6 +25,7 @@ export class UploadsController {
 
   constructor(private readonly uploadsService: UploadsService) {}
 
+  @RateLimit({ limit: 15, ttlSeconds: 60 })
   @Post('presign')
   @UseGuards(JwtAuthGuard)
   async presign(@Req() req: any, @Body() dto: PresignUploadDto) {
@@ -42,10 +45,22 @@ export class UploadsController {
     @Req() req: any,
     @Res() res: any,
   ) {
-    const dir = path.join(this.storageDir, fileType, userId);
+    if (process.env.NODE_ENV === 'production') {
+      throw new NotFoundException('Mock upload endpoint is disabled in production.');
+    }
+    if (fileType.includes('..') || userId.includes('..') || filename.includes('..')) {
+      throw new BadRequestException('Invalid path traversal attempt.');
+    }
+    const safeFilename = path.basename(filename);
+    const safeUserId = path.basename(userId);
+    const safeFileType = path.basename(fileType);
+    const dir = path.join(this.storageDir, safeFileType, safeUserId);
+    if (!path.resolve(dir).startsWith(path.resolve(this.storageDir))) {
+      throw new BadRequestException('Invalid path traversal attempt.');
+    }
     fs.mkdirSync(dir, { recursive: true });
 
-    const filePath = path.join(dir, filename);
+    const filePath = path.join(dir, safeFilename);
     const writeStream = fs.createWriteStream(filePath);
 
     req.pipe(writeStream);
@@ -54,7 +69,7 @@ export class UploadsController {
       res.status(HttpStatus.OK).send({ success: true });
     });
 
-    req.on('error', (err) => {
+    req.on('error', (err: any) => {
       res.status(HttpStatus.INTERNAL_SERVER_ERROR).send({ error: err.message });
     });
   }
@@ -67,13 +82,25 @@ export class UploadsController {
     @Param('filename') filename: string,
     @Res() res: any,
   ) {
-    const filePath = path.join(this.storageDir, fileType, userId, filename);
+    if (process.env.NODE_ENV === 'production') {
+      throw new NotFoundException('Mock file serving endpoint is disabled in production.');
+    }
+    if (fileType.includes('..') || userId.includes('..') || filename.includes('..')) {
+      throw new BadRequestException('Invalid path traversal attempt.');
+    }
+    const safeFilename = path.basename(filename);
+    const safeUserId = path.basename(userId);
+    const safeFileType = path.basename(fileType);
+    const filePath = path.join(this.storageDir, safeFileType, safeUserId, safeFilename);
+    if (!path.resolve(filePath).startsWith(path.resolve(this.storageDir))) {
+      throw new BadRequestException('Invalid path traversal attempt.');
+    }
 
     if (!fs.existsSync(filePath)) {
       throw new NotFoundException('File not found');
     }
 
-    const ext = path.extname(filename).toLowerCase();
+    const ext = path.extname(safeFilename).toLowerCase();
     let contentType = 'application/octet-stream';
     if (ext === '.jpg' || ext === '.jpeg') contentType = 'image/jpeg';
     else if (ext === '.png') contentType = 'image/png';

@@ -154,6 +154,7 @@ const KNOWN_PLACEHOLDER_SECRETS = new Set([
   'placeholder_msg91_auth_key',
   'placeholder_template_id',
   'placeholder_auth_key',
+  'https://pub-placeholder.r2.dev',
   'secret',
   'changeme',
 ]);
@@ -288,7 +289,10 @@ export function validateEnv(
         KNOWN_PLACEHOLDER_SECRETS.has(validatedConfig.R2_ACCESS_KEY_ID) ||
         !validatedConfig.R2_SECRET_ACCESS_KEY ||
         KNOWN_PLACEHOLDER_SECRETS.has(validatedConfig.R2_SECRET_ACCESS_KEY) ||
-        !validatedConfig.R2_ENDPOINT
+        !validatedConfig.R2_ENDPOINT ||
+        (validatedConfig.R2_PUBLIC_URL &&
+          (KNOWN_PLACEHOLDER_SECRETS.has(validatedConfig.R2_PUBLIC_URL) ||
+            validatedConfig.R2_PUBLIC_URL.includes('placeholder')))
       ) {
         validationErrors.push(
           'PRODUCTION ERROR: Real Cloudflare R2 credentials (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT) are required in production.',
@@ -311,6 +315,18 @@ export function validateEnv(
     if (!validatedConfig.MSG91_AUTH_KEY || !validatedConfig.MSG91_TEMPLATE_ID) {
       validationErrors.push(
         'CONFIG ERROR: MSG91_AUTH_KEY and MSG91_TEMPLATE_ID must be provided when SMS_PROVIDER is set to "msg91".',
+      );
+    }
+  }
+
+  // Non-production safety guards: Never allow live credentials in staging/development/test
+  if (!isProduction) {
+    if (
+      validatedConfig.RAZORPAY_KEY_ID &&
+      validatedConfig.RAZORPAY_KEY_ID.startsWith('rzp_live_')
+    ) {
+      validationErrors.push(
+        'SECURITY ERROR: Live Razorpay key (rzp_live_...) is strictly forbidden in non-production environments.',
       );
     }
   }

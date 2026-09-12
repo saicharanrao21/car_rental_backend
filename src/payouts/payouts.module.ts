@@ -1,12 +1,26 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { PayoutsService } from './payouts.service';
 import { PayoutsController } from './payouts.controller';
 import { PrismaModule } from '../prisma/prisma.module';
+import { NotificationsModule } from '../notifications/notifications.module';
+import { AdminModule } from '../admin/admin.module';
+import { SystemConfigModule } from '../config-engine/system-config.module';
+import { WalletsModule } from '../wallets/wallets.module';
+import { PaymentsModule } from '../payments/payments.module';
+
+import { RazorpayXPayoutProvider } from './providers/razorpayx-payout.provider';
 
 @Module({
-  imports: [PrismaModule],
+  imports: [
+    PrismaModule,
+    NotificationsModule,
+    AdminModule,
+    SystemConfigModule,
+    forwardRef(() => WalletsModule),
+    forwardRef(() => PaymentsModule),
+  ],
   controllers: [PayoutsController],
-  providers: [PayoutsService],
-  exports: [PayoutsService],
+  providers: [PayoutsService, RazorpayXPayoutProvider],
+  exports: [PayoutsService, RazorpayXPayoutProvider],
 })
 export class PayoutsModule {}

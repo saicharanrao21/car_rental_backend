@@ -5,12 +5,23 @@ import {
   ForbiddenException,
   ConflictException,
   Logger,
+  Optional,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaymentsService } from '../payments/payments.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { AuditLogService } from '../admin/audit-log.service';
-import { SecurityDepositStatus, Role, Prisma } from '@prisma/client';
+import {
+  SecurityDepositStatus,
+  Role,
+  Prisma,
+  LedgerAccountType,
+  LedgerEntrySide,
+} from '@prisma/client';
+import { LedgerCoreService } from '../finance/ledger-core.service';
 
 @Injectable()
 export class DepositsService {
@@ -21,7 +32,63 @@ export class DepositsService {
     private readonly paymentsService: PaymentsService,
     private readonly notificationsService: NotificationsService,
     private readonly auditLogService: AuditLogService,
+    @Optional()
+    @Inject(forwardRef(() => LedgerCoreService))
+    private readonly ledgerCore?: LedgerCoreService,
   ) {}
+
+  /**
+   * Automated worker running every hour to release security deposits for trips completed >= 24h ago with no active damage claims.
+   */
+  @Cron(CronExpression.EVERY_HOUR)
+  async autoReleaseEligibleDeposits() {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    try {
+      const eligibleDeposits = await this.prisma.securityDeposit.findMany({
+        where: {
+          status: SecurityDepositStatus.HELD,
+          booking: {
+            status: 'COMPLETED',
+            updatedAt: { lte: twentyFourHoursAgo },
+            damageClaims: {
+              none: {
+                status: {
+                  in: [
+                    'SUBMITTED',
+                    'UNDER_REVIEW',
+                    'APPROVED',
+                    'PARTIALLY_APPROVED',
+                  ],
+                },
+              },
+            },
+          },
+        },
+        take: 20,
+      });
+
+      for (const deposit of eligibleDeposits) {
+        try {
+          await this.releaseDeposit(
+            deposit.bookingId,
+            undefined,
+            'Automated 24-hour post-trip deposit release',
+          );
+          this.logger.log(
+            `Auto-released deposit for booking ${deposit.bookingId}`,
+          );
+        } catch (err: any) {
+          this.logger.error(
+            `Auto-release failed for booking ${deposit.bookingId}: ${err.message}`,
+          );
+        }
+      }
+    } catch (err: any) {
+      this.logger.warn(`Failed to query eligible auto-release deposits: ${err.message}`);
+    }
+  }
+
 
   /**
    * Retrieves security deposit record for a booking with RBAC checks.
@@ -112,7 +179,10 @@ export class DepositsService {
     });
 
     if (!deposit) {
-      throw new NotFoundException('Security deposit record not found.');
+      this.logger.warn(
+        `releaseDeposit invoked for booking ${bookingId}, but no security deposit record exists. Skipping deposit release.`,
+      );
+      return null;
     }
 
     if (deposit.status !== SecurityDepositStatus.HELD) {
@@ -189,6 +259,38 @@ export class DepositsService {
       },
     });
 
+    if (this.ledgerCore && deposit.booking) {
+      try {
+        await this.ledgerCore.recordJournal({
+          referenceType: 'SECURITY_DEPOSIT_RELEASE',
+          referenceId: deposit.id,
+          bookingId: deposit.bookingId,
+          narration: `Security deposit refund for booking ${deposit.bookingId} (${reason || 'Standard release'})`,
+          idempotencyKey: `jrn_dep_rel_${deposit.id}`,
+          lines: [
+            {
+              accountType: LedgerAccountType.CUSTOMER_DEPOSIT_ESCROW,
+              accountEntityId: deposit.booking.customerId,
+              side: LedgerEntrySide.DEBIT,
+              amount: remainingToRefund,
+              narration: `Escrow liability released on deposit refund for booking ${deposit.bookingId}`,
+              bookingId: deposit.bookingId,
+            },
+            {
+              accountType: LedgerAccountType.GATEWAY_CLEARING,
+              accountEntityId: 'RAZORPAY',
+              side: LedgerEntrySide.CREDIT,
+              amount: remainingToRefund,
+              narration: `Gateway refund clearing for released security deposit on booking ${deposit.bookingId}`,
+              bookingId: deposit.bookingId,
+            },
+          ],
+        });
+      } catch (ledgerErr: any) {
+        this.logger.error(`Failed to record deposit release ledger journal: ${ledgerErr.message}`);
+      }
+    }
+
     if (adminUserId) {
       this.auditLogService.log(
         adminUserId,
@@ -234,23 +336,25 @@ export class DepositsService {
     });
 
     if (!deposit) {
-      throw new NotFoundException('Security deposit record not found.');
+      this.logger.warn(
+        `settleDeduction invoked for booking ${bookingId}, but no security deposit record exists. Skipping deposit deduction.`,
+      );
+      return null;
     }
 
     if (deposit.status !== SecurityDepositStatus.HELD) {
-      throw new ConflictException(
-        `Deposit cannot be settled in status: ${deposit.status}`,
+      this.logger.warn(
+        `Deposit for booking ${bookingId} cannot be settled in status: ${deposit.status}. Skipping deduction.`,
       );
+      return deposit;
     }
 
     const deductDecimal = new Prisma.Decimal(deductAmount);
-    if (deductDecimal.gt(deposit.amount)) {
-      throw new BadRequestException(
-        `Deduction amount (${deductAmount}) cannot exceed total deposit (${deposit.amount.toNumber()}).`,
-      );
-    }
+    const actualDeductDecimal = deductDecimal.gt(deposit.amount)
+      ? deposit.amount
+      : deductDecimal;
 
-    const remainingRefund = deposit.amount.sub(deductDecimal);
+    const remainingRefund = deposit.amount.sub(actualDeductDecimal);
     const targetStatus = remainingRefund.gt(0)
       ? SecurityDepositStatus.PARTIALLY_REFUNDED
       : SecurityDepositStatus.FORFEITED;
@@ -263,7 +367,7 @@ export class DepositsService {
       },
       data: {
         status: targetStatus,
-        deductedAmount: deductDecimal,
+        deductedAmount: actualDeductDecimal,
         releasedAt: new Date(),
       },
     });
@@ -312,6 +416,55 @@ export class DepositsService {
       },
     });
 
+    if (this.ledgerCore && deposit.booking) {
+      try {
+        const journalLines: any[] = [
+          {
+            accountType: LedgerAccountType.CUSTOMER_DEPOSIT_ESCROW,
+            accountEntityId: deposit.booking.customerId,
+            side: LedgerEntrySide.DEBIT,
+            amount: deposit.amount,
+            narration: `Total escrow deposit settled after damage assessment for booking ${deposit.bookingId}`,
+            bookingId: deposit.bookingId,
+          },
+        ];
+
+        if (actualDeductDecimal.gt(0)) {
+          journalLines.push({
+            accountType: LedgerAccountType.VENDOR_PAYABLE,
+            accountEntityId: deposit.booking.vendorId,
+            side: LedgerEntrySide.CREDIT,
+            amount: actualDeductDecimal,
+            narration: `Damage compensation payable to host from security deposit for booking ${deposit.bookingId}: ${reason}`,
+            bookingId: deposit.bookingId,
+          });
+        }
+
+        if (remainingRefund.gt(0)) {
+          journalLines.push({
+            accountType: LedgerAccountType.GATEWAY_CLEARING,
+            accountEntityId: 'RAZORPAY',
+            side: LedgerEntrySide.CREDIT,
+            amount: remainingRefund,
+            narration: `Remaining security deposit refunded to customer for booking ${deposit.bookingId}`,
+            bookingId: deposit.bookingId,
+          });
+        }
+
+        await this.ledgerCore.recordJournal({
+          referenceType: 'DAMAGE_DEDUCTION',
+          referenceId: deposit.id,
+          bookingId: deposit.bookingId,
+          vendorId: deposit.booking.vendorId,
+          narration: `Security deposit damage deduction settlement for booking ${deposit.bookingId} (${reason})`,
+          idempotencyKey: `jrn_dep_deduct_${deposit.id}`,
+          lines: journalLines,
+        });
+      } catch (ledgerErr: any) {
+        this.logger.error(`Failed to record deposit deduction ledger journal: ${ledgerErr.message}`);
+      }
+    }
+
     this.auditLogService.log(
       adminUserId,
       'SECURITY_DEPOSIT_SETTLED_WITH_DEDUCTION',
@@ -319,7 +472,8 @@ export class DepositsService {
       deposit.id,
       {
         bookingId,
-        deductedAmount: deductDecimal.toNumber(),
+        deductedAmount: actualDeductDecimal.toNumber(),
+        totalClaimedAmount: deductAmount,
         refundedAmount: remainingRefund.toNumber(),
         reason,
       },

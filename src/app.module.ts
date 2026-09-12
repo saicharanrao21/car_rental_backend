@@ -23,7 +23,33 @@ import { DisputesModule } from './disputes/disputes.module';
 import { SupportedCitiesModule } from './supported-cities/supported-cities.module';
 import { DepositsModule } from './deposits/deposits.module';
 import { DamageClaimsModule } from './damage-claims/damage-claims.module';
+import { CouponsModule } from './coupons/coupons.module';
+import { KycModule } from './kyc/kyc.module';
+import { InvoicesModule } from './invoices/invoices.module';
+import { SupportTicketsModule } from './support/support-tickets.module';
+import { EmergencyAssistanceModule } from './emergency/emergency-assistance.module';
+import { ProtectionPackagesModule } from './protection/protection-packages.module';
+import { WalletsModule } from './wallets/wallets.module';
+import { ReferralsModule } from './referrals/referrals.module';
+import { LoyaltyModule } from './loyalty/loyalty.module';
+import { FraudModule } from './fraud/fraud.module';
+import { LocationsModule } from './locations/locations.module';
+import { WhatsAppModule } from './whatsapp/whatsapp.module';
+import { GrowthModule } from './growth/growth.module';
+import { AnalyticsModule } from './analytics/analytics.module';
+import { QueuesModule } from './queues/queues.module';
+import { SystemConfigModule } from './config-engine/system-config.module';
+import { GeospatialModule } from './geospatial/geospatial.module';
+import { PricingModule } from './pricing/pricing.module';
+import { IntegrationsModule } from './integrations/integrations.module';
+import { FleetModule } from './fleet/fleet.module';
+import { OperationsModule } from './operations/operations.module';
+import { MarketplaceModule } from './marketplace/marketplace.module';
+import { FulfillmentModule } from './fulfillment/fulfillment.module';
+import { CorporateModule } from './corporate/corporate.module';
 import { CorrelationIdMiddleware } from './common/correlation-id.middleware';
+import { APP_GUARD } from '@nestjs/core';
+import { RateLimiterGuard } from './common/guards/rate-limiter.guard';
 
 import { ScheduleModule } from '@nestjs/schedule';
 import { validateEnv } from './common/env.validation';
@@ -37,6 +63,10 @@ import { validateEnv } from './common/env.validation';
     ScheduleModule.forRoot(),
     PrismaModule,
     RedisModule,
+    QueuesModule,
+    SystemConfigModule,
+    IntegrationsModule,
+    GeospatialModule,
     AuthModule,
     UsersModule,
     VendorsModule,
@@ -56,9 +86,35 @@ import { validateEnv } from './common/env.validation';
     SupportedCitiesModule,
     DepositsModule,
     DamageClaimsModule,
+    CouponsModule,
+    KycModule,
+    InvoicesModule,
+    SupportTicketsModule,
+    EmergencyAssistanceModule,
+    ProtectionPackagesModule,
+    WalletsModule,
+    ReferralsModule,
+    LoyaltyModule,
+    FraudModule,
+    LocationsModule,
+    WhatsAppModule,
+    GrowthModule,
+    AnalyticsModule,
+    PricingModule,
+    FleetModule,
+    OperationsModule,
+    MarketplaceModule,
+    FulfillmentModule,
+    CorporateModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    {
+      provide: APP_GUARD,
+      useClass: RateLimiterGuard,
+    },
+  ],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {

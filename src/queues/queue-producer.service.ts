@@ -1,0 +1,171 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { QueueFactoryService } from './queue-factory.service';
+import { QUEUE_NAMES, JOB_TYPES } from './queue.constants';
+
+export interface SmsNotificationJobData {
+  phone: string;
+  message: string;
+  otpCode?: string;
+  correlationId?: string;
+}
+
+export interface EmailNotificationJobData {
+  to: string;
+  subject: string;
+  htmlContent: string;
+  bookingId?: string;
+  correlationId?: string;
+}
+
+export interface PushNotificationJobData {
+  userId: string;
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+  correlationId?: string;
+}
+
+export interface WhatsAppNotificationJobData {
+  phone: string;
+  templateName: string;
+  language?: string;
+  bodyParameters: string[];
+  userId?: string;
+  bookingId?: string;
+  correlationId?: string;
+}
+
+export interface WebhookJobData {
+  event: string;
+  payload: any;
+  signature?: string;
+  receivedAt: string;
+}
+
+export interface CleanupJobData {
+  task: 'PURGE_EXPIRED_OTPS' | 'EXPIRE_STALE_BOOKINGS' | 'CLEAN_TEMP_STORAGE';
+  olderThanDate?: string;
+  timeoutMinutes?: number;
+}
+
+@Injectable()
+export class QueueProducerService {
+  private readonly logger = new Logger(QueueProducerService.name);
+
+  constructor(private readonly queueFactory: QueueFactoryService) {}
+
+  /**
+   * Enqueues an SMS notification task.
+   */
+  async dispatchSmsNotification(data: SmsNotificationJobData) {
+    const jobId = data.correlationId || `sms-${data.phone}-${Date.now()}`;
+    return this.queueFactory.addJob(
+      QUEUE_NAMES.NOTIFICATIONS,
+      JOB_TYPES.NOTIFICATIONS.SEND_SMS,
+      data,
+      {
+        jobId,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+      },
+    );
+  }
+
+  /**
+   * Enqueues an Email notification task.
+   */
+  async dispatchEmailNotification(data: EmailNotificationJobData) {
+    const jobId = data.correlationId || `email-${data.to}-${Date.now()}`;
+    return this.queueFactory.addJob(
+      QUEUE_NAMES.NOTIFICATIONS,
+      JOB_TYPES.NOTIFICATIONS.SEND_EMAIL,
+      data,
+      {
+        jobId,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+      },
+    );
+  }
+
+  /**
+   * Enqueues a Push notification task.
+   */
+  async dispatchPushNotification(data: PushNotificationJobData) {
+    const jobId = data.correlationId || `push-${data.userId}-${Date.now()}`;
+    return this.queueFactory.addJob(
+      QUEUE_NAMES.NOTIFICATIONS,
+      JOB_TYPES.NOTIFICATIONS.SEND_PUSH,
+      data,
+      {
+        jobId,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+      },
+    );
+  }
+
+  /**
+   * Enqueues a WhatsApp notification task.
+   */
+  async dispatchWhatsAppNotification(data: WhatsAppNotificationJobData) {
+    const jobId = data.correlationId || `whatsapp-${data.phone}-${Date.now()}`;
+    return this.queueFactory.addJob(
+      QUEUE_NAMES.NOTIFICATIONS,
+      JOB_TYPES.NOTIFICATIONS.SEND_WHATSAPP,
+      data,
+      {
+        jobId,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+      },
+    );
+  }
+
+  /**
+   * Enqueues an incoming Razorpay webhook for asynchronous processing.
+   */
+  async dispatchWebhookProcessing(data: WebhookJobData) {
+    const jobId = `webhook-${data.event}-${Date.now()}`;
+    return this.queueFactory.addJob(
+      QUEUE_NAMES.WEBHOOKS,
+      JOB_TYPES.WEBHOOKS.PROCESS_RAZORPAY_PAYMENT,
+      data,
+      { jobId },
+    );
+  }
+
+  /**
+   * Enqueues a maintenance cleanup task.
+   */
+  async dispatchCleanupTask(data: CleanupJobData) {
+    const jobId = `cleanup-${data.task}-${Date.now()}`;
+    let jobType: string;
+    if (data.task === 'EXPIRE_STALE_BOOKINGS') {
+      jobType = JOB_TYPES.CLEANUP.EXPIRE_STALE_BOOKINGS;
+    } else if (data.task === 'CLEAN_TEMP_STORAGE') {
+      jobType = JOB_TYPES.CLEANUP.CLEAN_TEMP_STORAGE;
+    } else {
+      jobType = JOB_TYPES.CLEANUP.PURGE_EXPIRED_OTPS;
+    }
+    return this.queueFactory.addJob(
+      QUEUE_NAMES.CLEANUP,
+      jobType,
+      data,
+      { jobId },
+    );
+  }
+
+  /**
+   * Enqueues an analytics event for asynchronous batch processing.
+   */
+  async dispatchAnalyticsEvent(data: any) {
+    const jobId = data.idempotencyKey || `analytics-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    return this.queueFactory.addJob(
+      QUEUE_NAMES.ANALYTICS,
+      JOB_TYPES.ANALYTICS.TRACK_EVENT,
+      data,
+      { jobId },
+    );
+  }
+}

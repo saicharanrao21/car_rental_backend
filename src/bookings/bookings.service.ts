@@ -19,6 +19,9 @@ import {
   VerificationStatus,
   InspectionType,
   HandoverOtpType,
+  VehicleHoldStatus,
+  VehicleOperationalStatus,
+  VehicleVerificationStatus,
   Prisma,
 } from '@prisma/client';
 import { PaginationDto } from '../common/pagination.dto';
@@ -28,6 +31,22 @@ import { CancellationPolicyService } from './cancellation-policy.service';
 import { redactVendor } from '../common/vendor-redactor.util';
 import { AuditLogService } from '../admin/audit-log.service';
 import { HandoverOtpService } from './handover-otp.service';
+import { CouponsService } from '../coupons/coupons.service';
+import { DepositRulesService } from '../deposits/deposit-rules.service';
+import { InvoicesService } from '../invoices/invoices.service';
+import { ReferralsService } from '../referrals/referrals.service';
+import { LoyaltyService } from '../loyalty/loyalty.service';
+import { FraudService, RiskAction } from '../fraud/fraud.service';
+import { RedisCacheService } from '../redis/redis-cache.service';
+import { REDIS_NAMESPACES } from '../redis/redis-namespace.constants';
+import { Optional } from '@nestjs/common';
+import { SecurityDepositStatus } from '@prisma/client';
+import { BookingLifecycleService } from './booking-lifecycle.service';
+import { BookingOutboxService } from './booking-outbox.service';
+import { LocationsService } from '../locations/locations.service';
+import { VehicleAvailabilityService } from '../cars/vehicle-availability.service';
+import { PricingService } from '../pricing/pricing.service';
+import { VehicleOperationsEligibilityService } from '../cars/vehicle-operations-eligibility.service';
 
 @Injectable()
 export class BookingsService {
@@ -43,6 +62,19 @@ export class BookingsService {
     private readonly cancellationPolicyService: CancellationPolicyService,
     private readonly auditLogService: AuditLogService,
     private readonly handoverOtpService: HandoverOtpService,
+    private readonly couponsService: CouponsService,
+    @Optional() private readonly depositRulesService?: DepositRulesService,
+    @Optional() private readonly invoicesService?: InvoicesService,
+    @Optional() private readonly referralsService?: ReferralsService,
+    @Optional() private readonly loyaltyService?: LoyaltyService,
+    @Optional() private readonly fraudService?: FraudService,
+    @Optional() private readonly cacheService?: RedisCacheService,
+    @Optional() private readonly locationsService?: LocationsService,
+    @Optional() private readonly lifecycleService?: BookingLifecycleService,
+    @Optional() private readonly outboxService?: BookingOutboxService,
+    @Optional() private readonly availabilityService?: VehicleAvailabilityService,
+    @Optional() private readonly pricingService?: PricingService,
+    @Optional() private readonly vehicleEligibilityService?: VehicleOperationsEligibilityService,
   ) {}
 
   async createBooking(customerId: string, dto: CreateBookingDto) {
@@ -95,6 +127,20 @@ export class BookingsService {
         throw new NotFoundException('Car not found.');
       }
 
+      // Check operational readiness status
+      if (car.operationalStatus && car.operationalStatus !== VehicleOperationalStatus.ACTIVE) {
+        throw new ConflictException(
+          `Cannot book vehicle: Vehicle operational status is ${car.operationalStatus}. Vehicle must be ACTIVE.`,
+        );
+      }
+
+      // Check vehicle verification status
+      if (car.verificationStatus && car.verificationStatus !== VehicleVerificationStatus.VERIFIED) {
+        throw new BadRequestException(
+          `Cannot book vehicle: Vehicle verification status is ${car.verificationStatus}. Vehicle must be VERIFIED.`,
+        );
+      }
+
       if (car.vendor?.verificationStatus !== VerificationStatus.VERIFIED) {
         throw new BadRequestException(
           'Cannot book a vehicle from an unverified vendor.',
@@ -103,6 +149,20 @@ export class BookingsService {
 
       if (!car.isAvailable) {
         throw new ConflictException('This car is marked as unavailable.');
+      }
+
+      // If eligibility service is wired, perform authoritative check
+      if (this.vehicleEligibilityService) {
+        const eligibility = await this.vehicleEligibilityService.evaluateEligibility(dto.carId);
+        if (!eligibility.eligible) {
+          const blockerMsgs = eligibility.blockers
+            .filter((b) => b.severity === 'BLOCKER')
+            .map((b) => b.message)
+            .join(' | ');
+          throw new BadRequestException(
+            `Cannot book vehicle: ${blockerMsgs || 'Vehicle does not meet platform operational readiness standards.'}`,
+          );
+        }
       }
 
       // Check if tripType is supported by the car
@@ -138,31 +198,270 @@ export class BookingsService {
         1,
         Math.ceil(durationMs / (1000 * 60 * 60 * 24)),
       );
-      let basePackagePrice = new Prisma.Decimal(0);
 
-      if (
-        dto.tripType === TripType.LOCAL ||
-        dto.tripType === TripType.AIRPORT_TRANSFER
-      ) {
-        const durationHours = Math.ceil(durationMs / (1000 * 60 * 60));
-        basePackagePrice = car.pricePerHour.mul(durationHours);
+      let mileagePackage: any = null;
+      let basePackagePrice = new Prisma.Decimal(0);
+      let pricingBasis = 'LEGACY_DAILY';
+      let includedKmTotal: number | null = null;
+      let extraKmRateDecimal: Prisma.Decimal | null = null;
+
+      if (dto.mileagePackageId) {
+        mileagePackage = await this.prisma.mileagePackage.findUnique({
+          where: { id: dto.mileagePackageId },
+        });
+
+        if (!mileagePackage) {
+          throw new NotFoundException('Selected mileage package not found.');
+        }
+
+        if (mileagePackage.carId !== dto.carId) {
+          throw new BadRequestException(
+            'Mileage package does not belong to the selected car.',
+          );
+        }
+
+        if (!mileagePackage.isActive) {
+          throw new BadRequestException(
+            'Selected mileage package is no longer active.',
+          );
+        }
+
+        if (mileagePackage.tripType !== dto.tripType) {
+          throw new BadRequestException(
+            `Mileage package is for ${mileagePackage.tripType} but booking is for ${dto.tripType}.`,
+          );
+        }
+
+        basePackagePrice = mileagePackage.basePricePerDay.mul(durationDays);
+        extraKmRateDecimal = mileagePackage.extraKmRate;
+        pricingBasis = 'PACKAGE_TIER';
+        includedKmTotal = mileagePackage.includedKmPerDay
+          ? mileagePackage.includedKmPerDay * durationDays
+          : null;
       } else {
-        basePackagePrice = car.pricePerDay.mul(durationDays);
+        if (
+          dto.tripType === TripType.LOCAL ||
+          dto.tripType === TripType.AIRPORT_TRANSFER
+        ) {
+          const durationHours = Math.ceil(durationMs / (1000 * 60 * 60));
+          const pricePerHourDecimal = car.pricePerHour instanceof Prisma.Decimal
+            ? car.pricePerHour
+            : new Prisma.Decimal(car.pricePerHour || 0);
+          basePackagePrice = pricePerHourDecimal.mul(durationHours);
+          pricingBasis = 'LEGACY_HOURLY';
+        } else {
+          const pricePerDayDecimal = car.pricePerDay instanceof Prisma.Decimal
+            ? car.pricePerDay
+            : new Prisma.Decimal(car.pricePerDay || 0);
+          basePackagePrice = pricePerDayDecimal.mul(durationDays);
+          pricingBasis = 'LEGACY_DAILY';
+        }
       }
 
-      const distance = dto.distanceKm
+      const distance = (dto.distanceKm && !dto.mileagePackageId)
         ? new Prisma.Decimal(dto.distanceKm)
         : new Prisma.Decimal(0);
+
+      const pricePerKmForFare = dto.mileagePackageId
+        ? new Prisma.Decimal(0)
+        : car.pricePerKm;
 
       const fareDetails = this.fareCalculator.calculateFare(
         distance,
         basePackagePrice,
-        car.pricePerKm,
+        pricePerKmForFare,
         commissionPercent,
         durationDays,
         car.weeklyDiscountPercent || 0,
         car.monthlyDiscountPercent || 0,
       );
+
+      // Validate location exceptions / closures if pickupHubId or returnHubId is provided
+      if (dto.pickupHubId) {
+        const startDay = new Date(start);
+        startDay.setHours(0, 0, 0, 0);
+        const endDay = new Date(start);
+        endDay.setHours(23, 59, 59, 999);
+
+        const exception = await this.prisma.locationException.findFirst({
+          where: {
+            locationId: dto.pickupHubId,
+            date: { gte: startDay, lte: endDay },
+            isClosed: true,
+          },
+        });
+
+        if (exception) {
+          throw new ConflictException(
+            `Pickup location is closed on the selected date: ${exception.reason || 'Holiday/Closure'}.`,
+          );
+        }
+      }
+
+      if (dto.returnHubId && dto.returnHubId !== dto.pickupHubId) {
+        const returnStartDay = new Date(end);
+        returnStartDay.setHours(0, 0, 0, 0);
+        const returnEndDay = new Date(end);
+        returnEndDay.setHours(23, 59, 59, 999);
+
+        const returnException = await this.prisma.locationException.findFirst({
+          where: {
+            locationId: dto.returnHubId,
+            date: { gte: returnStartDay, lte: returnEndDay },
+            isClosed: true,
+          },
+        });
+
+        if (returnException) {
+          throw new ConflictException(
+            `Return location is closed on the selected return date: ${returnException.reason || 'Holiday/Closure'}.`,
+          );
+        }
+      }
+
+      let deliveryFee = new Prisma.Decimal(0);
+      let pickupFee = new Prisma.Decimal(0);
+      let returnFee = new Prisma.Decimal(0);
+      let oneWayFee = new Prisma.Decimal(0);
+
+      // Authoritative fulfillment quotation & availability validation
+      if (
+        this.locationsService &&
+        (dto.pickupHubId ||
+          dto.returnHubId ||
+          dto.deliveryLatitude !== undefined ||
+          dto.deliveryAddress ||
+          (dto.deliveryType && dto.deliveryType !== 'NONE'))
+      ) {
+        try {
+          const quote = await this.locationsService.calculateDeliveryQuote({
+            vendorId: car.vendorId,
+            customerLatitude: dto.deliveryLatitude,
+            customerLongitude: dto.deliveryLongitude,
+            deliveryAddress: dto.deliveryAddress,
+            pickupLocationId: dto.pickupHubId,
+            returnLocationId: dto.returnHubId,
+            carId: dto.carId,
+            startDate: dto.startDate,
+            endDate: dto.endDate,
+            pickupDate: dto.startDate,
+            returnDate: dto.endDate,
+          });
+
+          if (!quote.isAvailable && dto.deliveryType && dto.deliveryType !== 'NONE') {
+            throw new BadRequestException(
+              quote.reason || 'Requested fulfillment delivery is unavailable.',
+            );
+          }
+
+          deliveryFee = new Prisma.Decimal(quote.deliveryFee);
+          pickupFee = new Prisma.Decimal(quote.pickupFee);
+          returnFee = new Prisma.Decimal(quote.returnFee);
+          oneWayFee = new Prisma.Decimal(quote.oneWaySurcharge);
+        } catch (err: any) {
+          if (err instanceof BadRequestException || err instanceof ConflictException) {
+            throw err;
+          }
+          this.logger.warn(`Fulfillment quote resolution warning: ${err.message}`);
+          if (dto.deliveryType && dto.deliveryType !== 'NONE') {
+            throw new BadRequestException('Could not calculate authoritative delivery quote.');
+          }
+        }
+      }
+
+      const totalDeliveryAddons = deliveryFee.add(pickupFee).add(returnFee).add(oneWayFee);
+
+      const baseTotalDecimal =
+        fareDetails.total instanceof Prisma.Decimal
+          ? fareDetails.total
+          : new Prisma.Decimal(Number(fareDetails.total || 0));
+
+      const baseNetToVendorDecimal =
+        fareDetails.netToVendor instanceof Prisma.Decimal
+          ? fareDetails.netToVendor
+          : new Prisma.Decimal(Number(fareDetails.netToVendor || 0));
+
+      // Validate coupon if code provided
+      let validatedCoupon: any = null;
+      let finalTotalFare = baseTotalDecimal.add(totalDeliveryAddons);
+      let discountAmountDecimal: Prisma.Decimal | null = null;
+
+      if (dto.couponCode) {
+        validatedCoupon = await this.couponsService.validateCoupon(customerId, {
+          code: dto.couponCode,
+          carId: dto.carId,
+          subtotal: Number(fareDetails.total),
+          city: car.vendor.city,
+          tripType: dto.tripType,
+          carCategory: car.type,
+        });
+
+        discountAmountDecimal = new Prisma.Decimal(validatedCoupon.discountAmount);
+        const netPayable = Math.max(0, Number(fareDetails.total) - validatedCoupon.discountAmount) + totalDeliveryAddons.toNumber();
+        finalTotalFare = new Prisma.Decimal(netPayable);
+      } else if (this.referralsService) {
+        // Check Referee First-Booking Referral Benefit
+        const eligibility = await this.referralsService.getRefereeEligibility(customerId);
+        if (eligibility.eligible && Number(fareDetails.total) >= eligibility.minBookingAmount) {
+          discountAmountDecimal = new Prisma.Decimal(eligibility.discountAmount);
+          const netPayable = Math.max(0, Number(fareDetails.total) - eligibility.discountAmount) + totalDeliveryAddons.toNumber();
+          finalTotalFare = new Prisma.Decimal(netPayable);
+        }
+      }
+
+      // Resolve Protection Package if selected
+      let protectionPackage: any = null;
+      let protectionFeeDecimal = new Prisma.Decimal(0);
+      let protectionDeductibleDecimal: Prisma.Decimal | null = null;
+      let protectionCode: string | null = null;
+
+      if (dto.protectionPackageId) {
+        protectionPackage = await this.prisma.protectionPackage.findUnique({
+          where: { id: dto.protectionPackageId },
+        });
+        if (protectionPackage && protectionPackage.isActive) {
+          if (!protectionPackage.city || protectionPackage.city === car.vendor.city) {
+            protectionFeeDecimal = protectionPackage.dailyRate.mul(durationDays);
+            protectionDeductibleDecimal = protectionPackage.deductibleAmount;
+            protectionCode = protectionPackage.code;
+            finalTotalFare = finalTotalFare.add(protectionFeeDecimal);
+          }
+        }
+      }
+
+      // Calculate authoritative dynamic security deposit requirement
+      let depositAmount = 5000;
+      if (this.depositRulesService) {
+        depositAmount = await this.depositRulesService.getDepositAmount(
+          car.type,
+          car.vendor?.city,
+        );
+      }
+
+      // Synchronous Risk & Fraud Enforcement Gate
+      if (this.fraudService) {
+        const riskAssessment = await this.fraudService.evaluateUserRisk(
+          customerId,
+          {
+            actionName: 'CREATE_BOOKING',
+            fare: finalTotalFare.toNumber(),
+            referralCode: dto.couponCode,
+          },
+        );
+
+        if (riskAssessment.action === RiskAction.BLOCK) {
+          this.logger.warn(
+            `[FRAUD_BLOCK] Customer ${customerId} blocked from booking car ${dto.carId}. Score: ${riskAssessment.score}, Level: ${riskAssessment.riskLevel}, Signals: [${riskAssessment.signals.map((s) => s.code).join(', ')}]`,
+          );
+          throw new ForbiddenException(
+            'Booking request could not be processed due to security verification policy.',
+          );
+        } else if (riskAssessment.action === RiskAction.REVIEW_REQUIRED) {
+          this.logger.log(
+            `[FRAUD_REVIEW_REQUIRED] Customer ${customerId} flagged with high risk score ${riskAssessment.score}. Signals: [${riskAssessment.signals.map((s) => s.code).join(', ')}]`,
+          );
+        }
+      }
 
       // 2. Perform transactional double-booking check and creation (with 15s timeout to support slow pg_bouncer pools)
       const booking = await this.prisma.$transaction(
@@ -178,7 +477,9 @@ export class BookingsService {
                 in: [
                   BookingStatus.PENDING,
                   BookingStatus.CONFIRMED,
+                  BookingStatus.HANDOVER_READY,
                   BookingStatus.ONGOING,
+                  BookingStatus.RETURN_PENDING,
                 ],
               },
               AND: [{ startDate: { lt: end } }, { endDate: { gt: start } }],
@@ -191,24 +492,130 @@ export class BookingsService {
             );
           }
 
-          // 5. Create booking row
+          // Check overlapping operational blocks & maintenance windows
+          if ((tx as any).vehicleBlock) {
+            const overlappingBlock = await (tx as any).vehicleBlock.findFirst({
+              where: {
+                carId: dto.carId,
+                startDate: { lt: end },
+                endDate: { gt: start },
+              },
+            });
+
+            if (overlappingBlock) {
+              throw new ConflictException(
+                overlappingBlock.reason || 'This car has a scheduled maintenance or operational block during the selected date range.',
+              );
+            }
+          }
+
+          // Check overlapping active temporary holds by other customers
+          if ((tx as any).vehicleHold) {
+            const overlappingHold = await (tx as any).vehicleHold.findFirst({
+              where: {
+                carId: dto.carId,
+                customerId: { not: customerId },
+                status: VehicleHoldStatus.ACTIVE,
+                expiresAt: { gt: new Date() },
+                startDate: { lt: end },
+                endDate: { gt: start },
+              },
+            });
+
+            if (overlappingHold) {
+              throw new ConflictException(
+                'This car is currently on temporary hold by another customer during checkout.',
+              );
+            }
+          }
+
+          // Phase 35: Authoritative Quote acceptance and snapshot verification
+          let acceptedQuoteSnapshot: any = null;
+          if (dto.quoteId && this.pricingService && (tx as any).bookingQuote) {
+            const quoteRes = await this.pricingService.verifyAndAcceptQuote(
+              tx,
+              dto.quoteId,
+              customerId,
+              {
+                carId: dto.carId,
+                startDate: start,
+                endDate: end,
+                tripType: dto.tripType,
+              },
+            );
+            acceptedQuoteSnapshot = quoteRes.priceSnapshot;
+          }
+
+          // 5. Create booking row with dynamic security deposit, authoritative pricing snapshot and delivery options
           const newBooking = await tx.booking.create({
             data: {
               customerId,
               vendorId: car.vendorId,
               carId: dto.carId,
               tripType: dto.tripType,
+              quoteId: dto.quoteId,
+              priceSnapshot: acceptedQuoteSnapshot as any,
               pickupLocation: dto.pickupLocation,
               dropLocation: dto.dropLocation,
               startDate: start,
               endDate: end,
               distanceKm: dto.distanceKm ? distance : null,
-              baseFare: fareDetails.baseFare,
-              platformFee: fareDetails.platformFee,
-              gstAmount: fareDetails.gst,
-              totalFare: fareDetails.total,
-              netToVendor: fareDetails.netToVendor,
+              baseFare: acceptedQuoteSnapshot ? new Prisma.Decimal(acceptedQuoteSnapshot.subtotal) : fareDetails.baseFare,
+              platformFee: acceptedQuoteSnapshot
+                ? new Prisma.Decimal(acceptedQuoteSnapshot.lineItems.find((l: any) => l.type === 'PLATFORM_FEE')?.amount || 0)
+                : fareDetails.platformFee,
+              gstAmount: acceptedQuoteSnapshot
+                ? new Prisma.Decimal(acceptedQuoteSnapshot.taxTotal)
+                : fareDetails.gst,
+              totalFare: acceptedQuoteSnapshot
+                ? new Prisma.Decimal(acceptedQuoteSnapshot.tripFare)
+                : finalTotalFare,
+              netToVendor: acceptedQuoteSnapshot
+                ? new Prisma.Decimal(acceptedQuoteSnapshot.netToVendor)
+                : baseNetToVendorDecimal.add(totalDeliveryAddons),
+              driverIncluded: dto.driverIncluded ?? true,
+              childSeat: dto.childSeat ?? false,
+              extraLuggage: dto.extraLuggage ?? false,
+              deliveryType: dto.deliveryType ?? 'NONE',
+              deliveryAddress: dto.deliveryAddress,
+              deliveryLatitude: dto.deliveryLatitude,
+              deliveryLongitude: dto.deliveryLongitude,
+              deliveryFee,
+              pickupAddress: dto.pickupAddress,
+              pickupLatitude: dto.pickupLatitude,
+              pickupLongitude: dto.pickupLongitude,
+              pickupFee,
+              returnFee,
+              oneWayFee,
+              pickupHubId: dto.pickupHubId,
+              returnHubId: dto.returnHubId,
+              pickupName: dto.pickupName,
+              dropName: dto.dropName,
+              protectionPackageId: protectionPackage ? protectionPackage.id : null,
+              protectionCode,
+              protectionFee: protectionFeeDecimal,
+              protectionDeductible: protectionDeductibleDecimal,
+              couponId: validatedCoupon ? validatedCoupon.couponId : null,
+              couponCode: validatedCoupon ? validatedCoupon.code : null,
+              discountAmount: acceptedQuoteSnapshot
+                ? new Prisma.Decimal(acceptedQuoteSnapshot.discountTotal)
+                : discountAmountDecimal,
+              mileagePackageId: mileagePackage ? mileagePackage.id : null,
+              mileagePackageName: mileagePackage ? mileagePackage.name : null,
+              includedKmPerDay: mileagePackage ? mileagePackage.includedKmPerDay : null,
+              includedKmTotal,
+              packageBasePricePerDay: mileagePackage ? mileagePackage.basePricePerDay : null,
+              extraKmRate: extraKmRateDecimal,
+              pricingBasis,
               status: BookingStatus.PENDING,
+              securityDeposit: {
+                create: {
+                  amount: acceptedQuoteSnapshot
+                    ? new Prisma.Decimal(acceptedQuoteSnapshot.depositTotal)
+                    : new Prisma.Decimal(depositAmount),
+                  status: SecurityDepositStatus.REQUIRED,
+                },
+              },
             },
             include: {
               car: true,
@@ -220,30 +627,117 @@ export class BookingsService {
                   email: true,
                 },
               },
+              securityDeposit: true,
             },
           });
 
+          // Phase 34: Atomically convert any active holds for this customer and car to CONVERTED
+          if ((tx as any).vehicleHold) {
+            await (tx as any).vehicleHold.updateMany({
+              where: {
+                carId: dto.carId,
+                customerId,
+                status: VehicleHoldStatus.ACTIVE,
+              },
+              data: {
+                status: VehicleHoldStatus.CONVERTED,
+              },
+            });
+          }
+
+          // Phase 33: Atomically create BookingOutboxEvent in same database transaction
+          if ((tx as any).bookingOutboxEvent) {
+            await (tx as any).bookingOutboxEvent.create({
+              data: {
+                bookingId: newBooking.id,
+                eventType: 'BOOKING_CREATED',
+                aggregateType: 'BOOKING',
+                aggregateId: newBooking.id,
+                tenantId: newBooking.vendorId,
+                actorId: customerId,
+                actorRole: 'CUSTOMER',
+                previousStatus: 'PENDING',
+                newStatus: 'PENDING',
+                correlationId: `evt_booking_created_${newBooking.id}_${Date.now()}`,
+                payload: {
+                  bookingId: newBooking.id,
+                  customerId: newBooking.customerId,
+                  customerName: newBooking.customer.name,
+                  customerPhone: newBooking.customer.phone,
+                  vendorId: newBooking.vendorId,
+                  vendorName: car.vendor?.businessName,
+                  carId: newBooking.carId,
+                  vehicleName: `${newBooking.car.make} ${newBooking.car.model}`,
+                  registrationNumber: newBooking.car.registrationNumber,
+                  startDate: new Date(newBooking.startDate).toISOString(),
+                  endDate: new Date(newBooking.endDate).toISOString(),
+                  totalFare: Number(newBooking.totalFare),
+                  currency: 'INR',
+                  pickupLocation: newBooking.pickupLocation,
+                  dropLocation: newBooking.dropLocation || undefined,
+                  actionUrl: `/bookings/${newBooking.id}`,
+                },
+                status: 'PENDING',
+              },
+            });
+          }
+
           return newBooking;
         },
+
         {
           timeout: 15000,
         },
       );
 
+      // Invalidate vehicle search cache and detail cache
+      if (this.cacheService) {
+        if (typeof this.cacheService.invalidatePattern === 'function') {
+          await this.cacheService.invalidatePattern('cache:search:cars:*');
+        }
+        if (typeof this.cacheService.delete === 'function') {
+          await this.cacheService.delete(REDIS_NAMESPACES.CACHE.CAR_DETAIL(dto.carId));
+        }
+      }
+
       // After transaction completes, notify vendor
-      const vendorUser = await this.prisma.vendor.findUnique({
-        where: { id: booking.vendorId },
-        select: { userId: true },
-      });
-      if (vendorUser && vendorUser.userId) {
-        this.notificationsService
-          .notifyUser(
-            vendorUser.userId,
-            'New Booking Request',
-            `You have received a new booking request for ${booking.car.make} ${booking.car.model} (${booking.car.registrationNumber}).`,
-          )
+      if ((this.prisma as any).vendor?.findUnique) {
+        const vendorUser = await (this.prisma as any).vendor.findUnique({
+          where: { id: booking.vendorId },
+          select: { userId: true },
+        });
+        if (vendorUser && vendorUser.userId) {
+          this.notificationsService
+            .notifyUser(
+              vendorUser.userId,
+              'New Booking Request',
+              `You have received a new booking request for ${booking.car.make} ${booking.car.model} (${booking.car.registrationNumber}).`,
+            )
+            .catch((err) =>
+              this.logger.error('Failed to notify vendor of new booking', err),
+            );
+        }
+      }
+
+      // Trigger outbox dispatch asynchronously
+      if (this.outboxService) {
+        this.prisma.bookingOutboxEvent
+          ?.findFirst({
+            where: {
+              bookingId: booking.id,
+              eventType: 'BOOKING_CREATED',
+              status: 'PENDING',
+            },
+            orderBy: { createdAt: 'desc' },
+          })
+          .then((evt) => {
+            if (evt) this.outboxService!.dispatchEvent(evt.id);
+          })
           .catch((err) =>
-            this.logger.error('Failed to notify vendor of new booking', err),
+            this.logger.error(
+              'Failed to dispatch outbox event for booking created',
+              err,
+            ),
           );
       }
 
@@ -471,9 +965,20 @@ export class BookingsService {
     reason?: string,
     handoverOtp?: string,
   ) {
+    if (this.lifecycleService) {
+      const res = await this.lifecycleService.executeTransition({
+        bookingId,
+        actorId: requestingUser.userId,
+        actorRole: requestingUser.role,
+        targetStatus: newStatus,
+        reason,
+        handoverOtp,
+      });
+      return res.booking;
+    }
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
-      include: { vendor: true },
+      include: { vendor: true, securityDeposit: true },
     });
 
     if (!booking) {
@@ -591,6 +1096,12 @@ export class BookingsService {
     }
 
     if (newStatus === BookingStatus.COMPLETED) {
+      if (booking.disputeFlag && !isAdmin) {
+        throw new BadRequestException(
+          'Cannot complete trip: Booking is flagged with an active dispute or damage claim. Dispute must be resolved prior to completion.',
+        );
+      }
+
       // 1. Enforce finalized POST_TRIP inspection
       const postTrip = await this.prisma.inspection.findUnique({
         where: {
@@ -651,22 +1162,51 @@ export class BookingsService {
           where: { bookingId },
         });
         const amountPaid = payment?.amount || booking.totalFare;
-        cancellationCalc = this.cancellationPolicyService.calculateCancellation(
-          {
-            startDate: booking.startDate,
-            cancellationTime: new Date(),
-            amountPaid,
-            actorRole: requestingUser.role,
-            isAdminOverride: isAdmin && reason?.includes('admin_full_refund'),
-          },
-        );
+        const depositAmount = booking.securityDeposit?.amount || 0;
+        const snapshot = booking.priceSnapshot as any;
+        const historicalMatrix = snapshot?.metadata?.cancellationMatrix || snapshot?.cancellationMatrix;
+        const cancelParams = {
+          startDate: booking.startDate,
+          cancellationTime: new Date(),
+          amountPaid,
+          depositAmount,
+          actorRole: requestingUser.role,
+          isAdminOverride: isAdmin && reason?.includes('admin_full_refund'),
+          isPendingConfirmation: booking.status === BookingStatus.PENDING,
+          cancellationMatrix: historicalMatrix,
+        };
+        cancellationCalc =
+          typeof this.cancellationPolicyService.calculateCancellationWithConfig === 'function'
+            ? await this.cancellationPolicyService.calculateCancellationWithConfig(cancelParams)
+            : this.cancellationPolicyService.calculateCancellation(cancelParams);
 
-        await this.paymentsService.refund(
-          bookingId,
-          cancellationCalc.refundAmountInPaise,
-          reason,
-          cancellationCalc.tier,
-        );
+        if (cancellationCalc.refundAmountInPaise > 0) {
+          await this.paymentsService.refund(
+            bookingId,
+            cancellationCalc.refundAmountInPaise,
+            reason,
+            cancellationCalc.tier,
+          );
+        }
+
+        // Reconcile and cancel any associated security deposit record
+        if (this.prisma.securityDeposit) {
+          await this.prisma.securityDeposit.updateMany({
+            where: {
+              bookingId,
+              status: {
+                in: [
+                  SecurityDepositStatus.REQUIRED,
+                  SecurityDepositStatus.HELD,
+                ],
+              },
+            },
+            data: {
+              status: SecurityDepositStatus.CANCELLED,
+              releasedAt: new Date(),
+            },
+          });
+        }
       } finally {
         if (cancelLockToken) {
           await this.bookingLockService.releaseCancellationLock(
@@ -694,6 +1234,13 @@ export class BookingsService {
       include: { car: true, customer: true },
     });
 
+    if (this.cacheService) {
+      await this.cacheService.invalidatePattern('cache:search:cars:*');
+      if (updatedBooking.carId) {
+        await this.cacheService.delete(REDIS_NAMESPACES.CACHE.CAR_DETAIL(updatedBooking.carId));
+      }
+    }
+
     let title = '';
     let body = '';
     if (newStatus === BookingStatus.CONFIRMED) {
@@ -713,6 +1260,24 @@ export class BookingsService {
         this.logger.error('Failed to notify customer of status update', err),
       );
 
+    // Trigger Referral Qualification Trigger on Booking Completion
+    if (newStatus === BookingStatus.COMPLETED && this.referralsService) {
+      this.referralsService
+        .handleBookingCompleted(bookingId)
+        .catch((err) =>
+          this.logger.error(`Referral qualification failed for booking ${bookingId}:`, err),
+        );
+    }
+
+    // Trigger Loyalty Point Earning on Booking Completion
+    if (newStatus === BookingStatus.COMPLETED && this.loyaltyService) {
+      this.loyaltyService
+        .handleBookingCompleted(bookingId)
+        .catch((err) =>
+          this.logger.error(`Loyalty point crediting failed for booking ${bookingId}:`, err),
+        );
+    }
+
     return updatedBooking;
   }
 
@@ -722,7 +1287,7 @@ export class BookingsService {
   ) {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
-      include: { payment: true, vendor: true },
+      include: { payment: true, vendor: true, securityDeposit: true },
     });
 
     if (!booking) {
@@ -750,12 +1315,23 @@ export class BookingsService {
     }
 
     const amountPaid = booking.payment?.amount || booking.totalFare;
-    const calculation = this.cancellationPolicyService.calculateCancellation({
+    const depositAmount = booking.securityDeposit?.amount || 0;
+    const isPendingConfirmation = booking.status === BookingStatus.PENDING;
+    const snapshot = booking.priceSnapshot as any;
+    const historicalMatrix = snapshot?.metadata?.cancellationMatrix || snapshot?.cancellationMatrix;
+    const cancelParams = {
       startDate: booking.startDate,
       cancellationTime: new Date(),
       amountPaid,
+      depositAmount,
       actorRole: requestingUser.role,
-    });
+      isPendingConfirmation,
+      cancellationMatrix: historicalMatrix,
+    };
+    const calculation =
+      typeof this.cancellationPolicyService.calculateCancellationWithConfig === 'function'
+        ? await this.cancellationPolicyService.calculateCancellationWithConfig(cancelParams)
+        : this.cancellationPolicyService.calculateCancellation(cancelParams);
 
     return {
       bookingId: booking.id,
@@ -775,6 +1351,15 @@ export class BookingsService {
   }
 
   async cancelBooking(bookingId: string, customerId: string, reason: string) {
+    if (this.lifecycleService) {
+      const res = await this.lifecycleService.cancelBooking(
+        bookingId,
+        customerId,
+        Role.CUSTOMER,
+        reason,
+      );
+      return res.booking;
+    }
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
       include: { payment: true, vendor: true },
@@ -802,12 +1387,19 @@ export class BookingsService {
 
     try {
       const amountPaid = booking.payment?.amount || booking.totalFare;
-      const calculation = this.cancellationPolicyService.calculateCancellation({
+      const snapshot = booking.priceSnapshot as any;
+      const historicalMatrix = snapshot?.metadata?.cancellationMatrix || snapshot?.cancellationMatrix;
+      const cancelParams = {
         startDate: booking.startDate,
         cancellationTime: new Date(),
         amountPaid,
         actorRole: Role.CUSTOMER,
-      });
+        cancellationMatrix: historicalMatrix,
+      };
+      const calculation =
+        typeof this.cancellationPolicyService.calculateCancellationWithConfig === 'function'
+          ? await this.cancellationPolicyService.calculateCancellationWithConfig(cancelParams)
+          : this.cancellationPolicyService.calculateCancellation(cancelParams);
 
       await this.paymentsService.refund(
         bookingId,
@@ -889,6 +1481,61 @@ export class BookingsService {
     });
   }
 
+  validateStatusTransition(
+    currentStatus: BookingStatus,
+    targetStatus: BookingStatus,
+  ): void {
+    if (currentStatus === targetStatus) {
+      return;
+    }
+
+    const allowedTransitions: Record<BookingStatus, BookingStatus[]> = {
+      [BookingStatus.PENDING]: [
+        BookingStatus.CONFIRMED,
+        BookingStatus.CANCELLED,
+        BookingStatus.EXPIRED,
+      ],
+      [BookingStatus.CONFIRMED]: [
+        BookingStatus.HANDOVER_READY,
+        BookingStatus.ONGOING,
+        BookingStatus.CANCELLED,
+        BookingStatus.REFUND_PENDING,
+      ],
+      [BookingStatus.HANDOVER_READY]: [
+        BookingStatus.ONGOING,
+        BookingStatus.CANCELLED,
+      ],
+      [BookingStatus.ONGOING]: [
+        BookingStatus.RETURN_PENDING,
+        BookingStatus.COMPLETED,
+      ],
+      [BookingStatus.RETURN_PENDING]: [
+        BookingStatus.COMPLETED,
+        BookingStatus.DISPUTED,
+      ],
+      [BookingStatus.REFUND_PENDING]: [
+        BookingStatus.REFUNDED,
+        BookingStatus.DISPUTED,
+      ],
+      [BookingStatus.DISPUTED]: [
+        BookingStatus.COMPLETED,
+        BookingStatus.REFUND_PENDING,
+        BookingStatus.REFUNDED,
+      ],
+      [BookingStatus.COMPLETED]: [],
+      [BookingStatus.REFUNDED]: [],
+      [BookingStatus.CANCELLED]: [],
+      [BookingStatus.EXPIRED]: [],
+    };
+
+    const validTargets = allowedTransitions[currentStatus] || [];
+    if (!validTargets.includes(targetStatus)) {
+      throw new BadRequestException(
+        `Invalid booking status transition from ${currentStatus} to ${targetStatus}.`,
+      );
+    }
+  }
+
   private getAllowedNextStates(
     current: BookingStatus,
     role: Role,
@@ -908,8 +1555,12 @@ export class BookingsService {
         case BookingStatus.PENDING:
           return [BookingStatus.CONFIRMED, BookingStatus.CANCELLED];
         case BookingStatus.CONFIRMED:
-          return [BookingStatus.ONGOING];
+          return [BookingStatus.HANDOVER_READY, BookingStatus.ONGOING, BookingStatus.CANCELLED];
+        case BookingStatus.HANDOVER_READY:
+          return [BookingStatus.ONGOING, BookingStatus.CANCELLED];
         case BookingStatus.ONGOING:
+          return [BookingStatus.RETURN_PENDING, BookingStatus.COMPLETED];
+        case BookingStatus.RETURN_PENDING:
           return [BookingStatus.COMPLETED];
         default:
           return [];
@@ -933,6 +1584,14 @@ export class BookingsService {
 
     const isAdmin = requestingUser.role === Role.ADMIN;
     const isVendor = booking.vendor.userId === requestingUser.userId;
+    const isConfirmed = [
+      BookingStatus.CONFIRMED,
+      BookingStatus.HANDOVER_READY,
+      BookingStatus.ONGOING,
+      BookingStatus.RETURN_PENDING,
+      BookingStatus.COMPLETED,
+    ].includes(booking.status);
+
     const isPaid =
       booking.payment?.status === PaymentStatus.PAID ||
       booking.payment?.status === 'PAID';
@@ -941,6 +1600,7 @@ export class BookingsService {
     copy.vendor = redactVendor(booking.vendor, {
       isAdmin,
       isOwner: isVendor,
+      isConfirmed,
       isPaid,
     });
 

@@ -11,6 +11,7 @@ import {
   Msg91SmsProvider,
 } from './sms-provider.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
+import { PermissionsGuard } from './guards/permissions.guard';
 
 import { CommonModule } from '../common/common.module';
 
@@ -30,6 +31,10 @@ import { CommonModule } from '../common/common.module';
         const nodeEnv = configService.get<string>('NODE_ENV');
         const smsProvider = configService.get<string>('SMS_PROVIDER');
 
+        if (nodeEnv === 'production' && smsProvider === 'mock') {
+          throw new Error('CRITICAL SECURITY ERROR: MockSmsProvider cannot be used in production.');
+        }
+
         if (nodeEnv === 'production' || smsProvider === 'msg91') {
           return new Msg91SmsProvider(configService);
         }
@@ -39,6 +44,7 @@ import { CommonModule } from '../common/common.module';
       inject: [ConfigService],
     },
     JwtStrategy,
+    PermissionsGuard,
   ],
   exports: [
     AuthService,
@@ -46,6 +52,10 @@ import { CommonModule } from '../common/common.module';
     SmsProviderService,
     JwtStrategy,
     PassportModule,
+    PermissionsGuard,
   ],
 })
 export class AuthModule {}
+export * from './permissions.enum';
+export * from './decorators/permissions.decorator';
+export * from './guards/permissions.guard';

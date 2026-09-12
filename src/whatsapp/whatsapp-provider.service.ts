@@ -1,0 +1,148 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { WhatsAppProviderSendResult } from './whatsapp.types';
+
+export abstract class WhatsAppProvider {
+  abstract sendMessage(
+    to: string,
+    templateName: string,
+    language: string,
+    bodyParameters: string[],
+  ): Promise<WhatsAppProviderSendResult>;
+}
+
+@Injectable()
+export class MockWhatsAppProvider implements WhatsAppProvider {
+  private readonly logger = new Logger(MockWhatsAppProvider.name);
+
+  async sendMessage(
+    to: string,
+    templateName: string,
+    language: string,
+    bodyParameters: string[],
+  ): Promise<WhatsAppProviderSendResult> {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('CRITICAL SECURITY ERROR: MockWhatsAppProvider cannot be used in production.');
+    }
+    const mockMessageId = `wamid.mock_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    this.logger.log(
+      `[WHATSAPP-MOCK] Sent template "${templateName}" (${language}) to ${to} with params [${bodyParameters.join(', ')}]. ID: ${mockMessageId}`,
+    );
+
+    return {
+      providerMessageId: mockMessageId,
+      status: 'ACCEPTED',
+    };
+  }
+}
+
+@Injectable()
+export class MetaWhatsAppProvider implements WhatsAppProvider {
+  private readonly logger = new Logger(MetaWhatsAppProvider.name);
+  private readonly accessToken: string;
+  private readonly phoneNumberId: string;
+  private readonly apiVersion: string;
+
+  constructor(private readonly configService: ConfigService) {
+    this.accessToken = this.configService.get<string>('WHATSAPP_ACCESS_TOKEN') || '';
+    this.phoneNumberId = this.configService.get<string>('WHATSAPP_PHONE_NUMBER_ID') || '';
+    this.apiVersion = this.configService.get<string>('WHATSAPP_API_VERSION') || 'v20.0';
+  }
+
+  async sendMessage(
+    to: string,
+    templateName: string,
+    language: string,
+    bodyParameters: string[],
+  ): Promise<WhatsAppProviderSendResult> {
+    if (!this.accessToken || !this.phoneNumberId) {
+      const isProduction = process.env.NODE_ENV === 'production';
+      if (isProduction) {
+        this.logger.error(
+          '[EXTERNAL CREDENTIAL BLOCKER] WhatsApp dispatch failed in production: Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID.',
+        );
+        return {
+          providerMessageId: `wamid.blocked_${Date.now()}`,
+          status: 'FAILED',
+          errorCode: 'EXTERNAL_CREDENTIAL_BLOCKER',
+          errorMessage:
+            'EXTERNAL CREDENTIAL BLOCKER: Live WhatsApp Meta credentials (WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID) are not configured in production.',
+        };
+      }
+      this.logger.warn(
+        'WhatsApp credentials missing in dev/test. Returning simulated acceptance.',
+      );
+      return {
+        providerMessageId: `wamid.noop_${Date.now()}`,
+        status: 'ACCEPTED',
+      };
+    }
+
+    const cleanTo = to.replace(/\+/g, '');
+    const url = `https://graph.facebook.com/${this.apiVersion}/${this.phoneNumberId}/messages`;
+
+    const payload = {
+      messaging_product: 'whatsapp',
+      to: cleanTo,
+      type: 'template',
+      template: {
+        name: templateName,
+        language: { code: language },
+        components: [
+          {
+            type: 'body',
+            parameters: bodyParameters.map((text) => ({
+              type: 'text',
+              text: String(text),
+            })),
+          },
+        ],
+      },
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+      const data = await response.json();
+
+      if (!response.ok) {
+        this.logger.error(`Meta WhatsApp API error: ${JSON.stringify(data)}`);
+        return {
+          providerMessageId: `wamid.err_${Date.now()}`,
+          status: 'FAILED',
+          errorCode: data?.error?.code?.toString() || 'META_API_ERROR',
+          errorMessage: data?.error?.message || 'Failed to dispatch WhatsApp message',
+        };
+      }
+
+      const messageId = data?.messages?.[0]?.id || `wamid.meta_${Date.now()}`;
+      return {
+        providerMessageId: messageId,
+        status: 'ACCEPTED',
+      };
+    } catch (err: any) {
+      clearTimeout(timeout);
+      const isAbort = err?.name === 'AbortError';
+      const errMsg = isAbort ? 'Meta WhatsApp request timed out after 10000ms' : err.message;
+      this.logger.error(`Meta WhatsApp HTTP request failed: ${errMsg}`, err.stack);
+      return {
+        providerMessageId: `wamid.net_err_${Date.now()}`,
+        status: 'FAILED',
+        errorCode: isAbort ? 'TIMEOUT' : 'NETWORK_ERROR',
+        errorMessage: errMsg,
+      };
+    }
+  }
+}
